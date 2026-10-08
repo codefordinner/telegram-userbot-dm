@@ -1,0 +1,6 @@
+__pycache__/
+*.bak*
+.env
+*.session
+*.session-journal
+data/
