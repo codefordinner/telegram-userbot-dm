@@ -27,6 +27,10 @@ Userbot: принимает в личку музыку/видео и залив�
   * LIBRARY_ADMIN      — команды управления музыкальной библиотекой в личке: /find /last /info /rename /set
                          /del /stats /rescan (1/0, по умолчанию 1). Нужен beets В ТОЙ ЖЕ ВЕРСИИ, что и в контейнере
                          импорта, и общие папки библиотеки и конфига по тем же путям, что и там
+  * MUSIC_VIDEO_MAX_MIN — короткое видео («Исполнитель - Название», не дольше N минут, по умолчанию 12) считаем
+                         возможным музыкальным клипом: бот спрашивает, куда его, и при выборе «Музыка» достаёт звук
+                         в .m4a (нужен ffmpeg в образе; 0 — не спрашивать, всё видео идёт в фильмы)
+  * FFMPEG_BIN / FFPROBE_BIN — команды ffmpeg и ffprobe (по умолчанию ffmpeg и ffprobe)
   * BEETS_BIN          — команда beets (по умолчанию beet)
   * BEETS_CONFIG       — конфиг beets (по умолчанию /beets-cfg/config.yaml)
   * BEETS_PLUGINS      — плагины beets для команд бота (по умолчанию scrub; пусто = без плагинов)
@@ -171,6 +175,14 @@ CATCH_UP = env_flag("CATCH_UP", True)
 # Вопрос «музыка или фильм?», когда тип файла определить не удалось.
 BUTTONS_BOT_TOKEN = os.environ.get("BUTTONS_BOT_TOKEN", "").strip()
 CHOICE_TIMEOUT_SEC = int(os.environ.get("CHOICE_TIMEOUT_SEC", "300"))
+
+# Музыкальные клипы: короткое видео вида «Исполнитель - Название» — спрашиваем, не музыка ли это.
+MUSIC_VIDEO_MAX_MIN = float(os.environ.get("MUSIC_VIDEO_MAX_MIN", "12"))
+MUSIC_VIDEO_UNKNOWN_DURATION_MAX_BYTES = 150 * 1024 * 1024  # если Telegram не прислал длительность — судим по размеру
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
+FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", "600"))
+BOT_VERSION = "2026-10-09-library-clips"  # пишется в лог при старте: по нему видно, какая версия реально запущена
 
 # Управление библиотекой через beets (команды /find /rename /del …).
 LIBRARY_ADMIN = env_flag("LIBRARY_ADMIN", True)
@@ -863,6 +875,15 @@ async def progress_updater(status, state: TransferState, stop_event: asyncio.Eve
         pct = min(100, int(current / total * 100))
         icon = "📥" if phase == "download" else "📤"
         label = "Скачиваю" if phase == "download" else "Загружаю на сервер"
+        if phase == "convert":
+            shown = f"🎧 Достаю звук из видео «{state.filename}»…"
+            if shown != last_shown:
+                try:
+                    await status.edit(shown)
+                    last_shown = shown
+                except Exception as e:
+                    log.debug("Не удалось обновить прогресс: %s", e)
+            continue
         retries = UPLOAD_RETRIES if phase == "upload" else DOWNLOAD_RETRIES
         attempt_note = f" (попытка {state.attempt}/{retries})" if state.attempt > 1 else ""
         pause_note = "\n⏸ Жду перед повторной попыткой…" if state.waiting else ""
@@ -1302,17 +1323,89 @@ async def refresh_jellyfin() -> Optional[bool]:
     return ok
 
 
+# ---------- музыкальные клипы: звук из видео ----------
+_ARTIST_TITLE_RE = re.compile(r"^(.+?)\s+-\s+(.+)$")
+_MOVIE_MARKS_RE = re.compile(r"\b(\d{3,4}[pi]|WEB-?DL|WEB-?Rip|BD-?Rip|HD-?Rip|DVD-?Rip|Blu-?Ray|HDTV|[xh]\.?26[45])\b", re.IGNORECASE)
+
+
+def looks_like_music_video(stem: str, duration: float, size: int) -> bool:
+    """Короткое видео с названием «Исполнитель - Название» и без киношных пометок (1080p, WEB-DL, S01E02) —
+    скорее клип, чем фильм. Это не приговор: бот только спрашивает, куда класть."""
+    if MUSIC_VIDEO_MAX_MIN <= 0 or not _ARTIST_TITLE_RE.match(stem):
+        return False
+    if _MOVIE_MARKS_RE.search(stem) or _EPISODE_IN_NAME_RE.search(stem):
+        return False
+    if duration and duration > 0:
+        return duration <= MUSIC_VIDEO_MAX_MIN * 60
+    return size <= MUSIC_VIDEO_UNKNOWN_DURATION_MAX_BYTES
+
+
+async def _run_tool(cmd: list, timeout: int) -> tuple:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+    except FileNotFoundError:
+        raise TransferError(f"в образе бота нет «{cmd[0]}» — установите ffmpeg, чтобы доставать звук из клипов") from None
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        raise TransferError(f"«{cmd[0]}» не уложился в {timeout} сек") from None
+    return proc.returncode, raw.decode("utf-8", errors="replace").strip()
+
+
+async def extract_audio(src: Path, dst: Path, filename: str) -> None:
+    """Достаёт звук из видео в .m4a. AAC копируется без перекодирования, остальное кодируется в AAC 256 кбит/с.
+    Исполнитель и название берутся из имени «Исполнитель - Название», чтобы beets не импортировал трек без тегов."""
+    rc, out = await _run_tool(
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+         "-of", "csv=p=0", str(src)],
+        timeout=60,
+    )
+    codec = out.splitlines()[0].strip().lower() if rc == 0 and out else ""
+    if not codec:
+        raise TransferError("в этом видео нет звуковой дорожки")
+    audio_args = ["-c:a", "copy"] if codec == "aac" else ["-c:a", "aac", "-b:a", "256k"]
+
+    cmd = [FFMPEG_BIN, "-nostdin", "-y", "-v", "error", "-i", str(src), "-vn", "-map", "0:a:0", *audio_args]
+    m = _ARTIST_TITLE_RE.match(Path(filename).stem)
+    if m:
+        cmd += ["-metadata", f"artist={m.group(1).strip()}", "-metadata", f"title={m.group(2).strip()}"]
+    cmd += ["-movflags", "+faststart", "-f", "ipod", str(dst)]
+
+    rc, out = await _run_tool(cmd, timeout=FFMPEG_TIMEOUT_SEC)
+    if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
+        remove_quietly(dst)
+        raise TransferError(f"не удалось достать звук (ffmpeg: {out[-200:] or 'код ' + str(rc)})")
+
+
 # ---------- обработка одного файла ----------
-async def transfer_file(message, kind: str, filename: str, local_path: Path, state: TransferState) -> bool:
-    """Скачать → (для mp3) починить теги → залить. Возвращает True, если файл с таким именем уже был."""
+async def transfer_file(
+    message, kind: str, filename: str, local_path: Path, state: TransferState, extract: bool = False
+) -> bool:
+    """Скачать → (клип) достать звук → (для mp3) починить теги → залить.
+    Возвращает True, если файл с таким именем уже был."""
     ensure_disk_space(message.document.size or 0, state)
     await download_with_retry(message, local_path, state)
 
-    if kind == "music" and Path(filename).suffix.lower() == ".mp3":
-        await run_blocking(fix_mp3_tags, str(local_path))
+    upload_path = local_path
+    audio_path = local_path.with_suffix(".m4a")
+    try:
+        if extract:
+            state.begin("convert", 1, current=0, total=1)
+            await extract_audio(local_path, audio_path, filename)
+            upload_path = audio_path
 
-    url, user, pw = TARGETS[kind]
-    return await upload_with_retry(url, user, pw, filename, local_path, state)
+        if kind == "music" and Path(filename).suffix.lower() == ".mp3":
+            await run_blocking(fix_mp3_tags, str(upload_path))
+
+        url, user, pw = TARGETS[kind]
+        return await upload_with_retry(url, user, pw, filename, upload_path, state)
+    finally:
+        remove_quietly(audio_path)
 
 
 # ---------- вопросы пользователю (кнопки у бота-помощника или текстовый ответ) ----------
@@ -1833,6 +1926,37 @@ async def handle_dm(event):
         if kind is None:
             return
 
+    # Короткое «Исполнитель - Название.mp4» с видеодорожкой — вероятно, клип: спрашиваем, не музыка ли это.
+    extract_audio_flag = False
+    video_attr = next((a for a in attrs if isinstance(a, DocumentAttributeVideo)), None)
+    if (
+        kind == "movie" and video_attr is not None
+        and Path(orig_filename).suffix.lower() in VIDEO_EXTS
+        and looks_like_music_video(Path(orig_filename).stem, getattr(video_attr, "duration", 0) or 0, doc.size or 0)
+    ):
+        minutes = int((getattr(video_attr, "duration", 0) or 0) // 60)
+        secs = int((getattr(video_attr, "duration", 0) or 0) % 60)
+        length = f" ({minutes}:{secs:02d})" if getattr(video_attr, "duration", 0) else ""
+        choice = await ask_choice(
+            event,
+            f"🎬 «{orig_filename}»{length} — похоже на музыкальный клип.\nЧто сделать?",
+            [[("🎵 Музыка (достать звук)", "music"), ("🎬 Фильм", "movie")], [("✖️ Отмена", "cancel")]],
+            KIND_ALIASES,
+            "1 — музыка (достану звук), 2 — фильм, 0 — отмена",
+            lambda c: (
+                "✅ Достану звук и положу в 🎵 музыку." if c == "music"
+                else "✅ Понял, кладу в 🎬 фильмы." if c == "movie"
+                else "⌛ Ответа не дождался — файл пропущен." if c is None
+                else "✖️ Отменено."
+            ),
+        )
+        if choice not in ("music", "movie"):
+            return
+        if choice == "music":
+            kind = "music"
+            extract_audio_flag = True
+            orig_filename = Path(orig_filename).stem + ".m4a"
+
     # Расширения нет или это обрывок названия («Mr. Brightside») — дописываем по mime, ничего не отрезая.
     orig_filename, ext = ensure_extension(orig_filename, kind, mime_type)
     if asked:
@@ -1883,7 +2007,7 @@ async def handle_dm(event):
         final_text = None
         try:
             # Watchdog на зависания работает внутри transfer_file — на каждой попытке скачивания/отправки.
-            existed = await transfer_file(event.message, kind, filename, local_path, state)
+            existed = await transfer_file(event.message, kind, filename, local_path, state, extract_audio_flag)
             await stop_updater()
 
             note = "\n⚠️ Файл с таким именем уже был на сервере — заменён." if existed else ""
@@ -1932,8 +2056,8 @@ async def main():
         await client.start()
         me = await client.get_me()
         log.info(
-            "Userbot started as %s (id=%s), watching DMs from %s",
-            me.username, me.id, ALLOWED_SENDER_IDS or "ВСЕХ (!)",
+            "Userbot started as %s (id=%s), watching DMs from %s, version %s",
+            me.username, me.id, ALLOWED_SENDER_IDS or "ВСЕХ (!)", BOT_VERSION,
         )
         await client.run_until_disconnected()
     finally:
