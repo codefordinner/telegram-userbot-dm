@@ -24,16 +24,27 @@ Userbot: принимает в личку музыку/видео и залив�
                          (один раз нажмите в нём /start). Без токена бот спрашивает текстом: ответьте на его
                          вопрос «1» (музыка), «2» (фильм) или «0» (отмена)
   * CHOICE_TIMEOUT_SEC — сколько секунд ждать выбора, прежде чем пропустить файл (по умолчанию 300)
+  * LIBRARY_ADMIN      — команды управления музыкальной библиотекой в личке: /find /last /info /rename /set
+                         /del /stats /rescan (1/0, по умолчанию 1). Нужен beets В ТОЙ ЖЕ ВЕРСИИ, что и в контейнере
+                         импорта, и общие папки библиотеки и конфига по тем же путям, что и там
+  * BEETS_BIN          — команда beets (по умолчанию beet)
+  * BEETS_CONFIG       — конфиг beets (по умолчанию /beets-cfg/config.yaml)
+  * BEETS_PLUGINS      — плагины beets для команд бота (по умолчанию scrub; пусто = без плагинов)
+  * BEETS_TIMEOUT_SEC  — сколько секунд ждать одну команду beets (по умолчанию 120)
+  * NAVIDROME_URL/USER/PASS — после правок библиотеки запускать пересканирование Navidrome
+                         (по умолчанию http://navidrome:4533; без логина и пароля пересканирование отключено)
 """
 import asyncio
 import contextlib
 import errno
 import functools
+import hashlib
 import inspect
 import logging
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import time
 import unicodedata
@@ -161,6 +172,18 @@ CATCH_UP = env_flag("CATCH_UP", True)
 BUTTONS_BOT_TOKEN = os.environ.get("BUTTONS_BOT_TOKEN", "").strip()
 CHOICE_TIMEOUT_SEC = int(os.environ.get("CHOICE_TIMEOUT_SEC", "300"))
 
+# Управление библиотекой через beets (команды /find /rename /del …).
+LIBRARY_ADMIN = env_flag("LIBRARY_ADMIN", True)
+BEETS_BIN = os.environ.get("BEETS_BIN", "beet")
+BEETS_CONFIG = os.environ.get("BEETS_CONFIG", "/beets-cfg/config.yaml")
+# Плагины для команд бота. «-p» заменяет plugins из конфига: бот не должен тянуть chroma/fetchart и их зависимости.
+BEETS_PLUGINS = os.environ.get("BEETS_PLUGINS", "scrub")
+BEETS_TIMEOUT_SEC = int(os.environ.get("BEETS_TIMEOUT_SEC", "120"))
+# Navidrome: после правок библиотеки запускаем пересканирование (если заданы логин и пароль).
+NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "http://navidrome:4533")
+NAVIDROME_USER = os.environ.get("NAVIDROME_USER", "")
+NAVIDROME_PASS = os.environ.get("NAVIDROME_PASS", "")
+
 # Какие HTTP-статусы считаем успешной загрузкой и какие ошибки имеет смысл повторять.
 OK_UPLOAD_STATUSES = {200, 201, 204}
 RETRY_UPLOAD_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -217,7 +240,7 @@ http: Optional[httpx.AsyncClient] = None
 
 # Бот-помощник для inline-кнопок (создаётся в main(), если задан BUTTONS_BOT_TOKEN).
 bot_client: Optional[TelegramClient] = None
-# Ожидающие выбора: ключ ("cb", token) или ("reply", chat_id, id_вопроса) → Future с ответом.
+# Ожидающие выбора: ключ ("cb", token) или ("reply", chat_id, id_вопроса) → (Future с ответом, текстовые синонимы).
 PENDING_CHOICES: dict = {}
 
 
@@ -1292,17 +1315,18 @@ async def transfer_file(message, kind: str, filename: str, local_path: Path, sta
     return await upload_with_retry(url, user, pw, filename, local_path, state)
 
 
-# ---------- вопрос «музыка или фильм?» ----------
+# ---------- вопросы пользователю (кнопки у бота-помощника или текстовый ответ) ----------
 KIND_LABELS = {"music": "🎵 музыку", "movie": "🎬 фильмы"}
-CHOICE_ALIASES = {
+KIND_ALIASES = {
     "1": "music", "м": "music", "музыка": "music", "music": "music",
     "2": "movie", "ф": "movie", "фильм": "movie", "видео": "movie", "movie": "movie",
     "0": "cancel", "отмена": "cancel", "нет": "cancel", "cancel": "cancel",
 }
-
-
-def parse_choice(text: str) -> Optional[str]:
-    return CHOICE_ALIASES.get((text or "").strip().lower())
+YES_ALIASES = {
+    "да": "yes", "д": "yes", "yes": "yes", "y": "yes", "1": "yes",
+    "нет": "cancel", "н": "cancel", "no": "cancel", "n": "cancel", "0": "cancel",
+    "отмена": "cancel", "cancel": "cancel",
+}
 
 
 def sender_allowed(sender_id) -> bool:
@@ -1310,12 +1334,15 @@ def sender_allowed(sender_id) -> bool:
 
 
 def resolve_text_choice(event) -> bool:
-    """Текстовый ответ («1»/«2»/«0») на вопрос бота. True — ответ принят."""
+    """Текстовый ответ на вопрос бота (reply на его сообщение). True — ответ принят."""
     if not event.is_reply or not event.raw_text:
         return False
-    fut = PENDING_CHOICES.get(("reply", event.chat_id, event.reply_to_msg_id))
-    choice = parse_choice(event.raw_text)
-    if fut is None or choice is None or fut.done():
+    entry = PENDING_CHOICES.get(("reply", event.chat_id, event.reply_to_msg_id))
+    if entry is None:
+        return False
+    fut, aliases = entry
+    choice = aliases.get(event.raw_text.strip().lower())
+    if choice is None or fut.done():
         return False
     fut.set_result(choice)
     return True
@@ -1333,9 +1360,10 @@ def align_extension(filename: str, ext: str, kind: str, mime_type: Optional[str]
     return filename, ext
 
 
-async def ask_kind(event, filename: str) -> Optional[str]:
-    """Спрашивает, куда положить файл. Возвращает 'music' / 'movie' или None (отмена / нет ответа).
-    С ботом-помощником шлёт кнопки; плюс всегда принимает текстовый ответ на сообщение юзербота."""
+async def ask_choice(event, question: str, rows: list, aliases: dict, hint: str, done_note) -> Optional[str]:
+    """Задаёт вопрос и ждёт выбор. rows — кнопки [[(подпись, значение), …], …]; aliases — какие текстовые
+    ответы что значат; done_note(значение или None) — итоговый текст вопроса. Возвращает выбранное значение
+    или None, если ответа не дождались. С ботом-помощником шлёт кнопки; текстовый ответ работает всегда."""
     fut = asyncio.get_running_loop().create_future()
     token = uuid.uuid4().hex[:10]
     keys = []
@@ -1345,13 +1373,10 @@ async def ask_kind(event, filename: str) -> Optional[str]:
         try:
             helper_msg = await bot_client.send_message(
                 event.sender_id,
-                f"🤔 Не могу понять, что это за файл: «{filename}»\nКуда его положить?",
+                question,
                 buttons=[
-                    [
-                        Button.inline("🎵 Музыка", f"kind:{token}:music".encode()),
-                        Button.inline("🎬 Фильм", f"kind:{token}:movie".encode()),
-                    ],
-                    [Button.inline("✖️ Отмена", f"kind:{token}:cancel".encode())],
+                    [Button.inline(label, f"ask:{token}:{value}".encode()) for label, value in row]
+                    for row in rows
                 ],
             )
             keys.append(("cb", token))
@@ -1360,13 +1385,10 @@ async def ask_kind(event, filename: str) -> Optional[str]:
             log.warning("Бот-помощник не смог отправить кнопки (нажмите в нём /start): %s", e)
 
     how = "Нажмите кнопку в чате с ботом-помощником или ответьте" if helper_msg else "Ответьте на это сообщение"
-    prompt = await event.reply(
-        f"🤔 Не понимаю, что это за файл: «{filename}».\n"
-        f"{how}: 1 — музыка, 2 — фильм, 0 — отмена."
-    )
+    prompt = await event.reply(f"{question}\n{how}: {hint}.")
     keys.append(("reply", event.chat_id, prompt.id))
     for key in keys:
-        PENDING_CHOICES[key] = fut
+        PENDING_CHOICES[key] = (fut, aliases)
 
     try:
         choice = await asyncio.wait_for(fut, timeout=CHOICE_TIMEOUT_SEC)
@@ -1376,34 +1398,49 @@ async def ask_kind(event, filename: str) -> Optional[str]:
         for key in keys:
             PENDING_CHOICES.pop(key, None)
 
-    result = choice if choice in KIND_LABELS else None
-    if result:
-        note = f"✅ Понял, кладу в {KIND_LABELS[result]}."
-    elif choice is None:
-        note = "⌛ Ответа не дождался — файл пропущен."
-    else:
-        note = "✖️ Отменено."
+    note = done_note(choice)
     await safe_edit(prompt, note)
     if helper_msg is not None:
         with contextlib.suppress(Exception):
             await helper_msg.edit(note)  # заодно убирает кнопки
-    return result
+    return choice
 
 
-async def on_kind_button(event):
+def _kind_note(choice: Optional[str]) -> str:
+    if choice in KIND_LABELS:
+        return f"✅ Понял, кладу в {KIND_LABELS[choice]}."
+    if choice is None:
+        return "⌛ Ответа не дождался — файл пропущен."
+    return "✖️ Отменено."
+
+
+async def ask_kind(event, filename: str) -> Optional[str]:
+    """Музыка или фильм? Возвращает 'music' / 'movie' или None (отмена / нет ответа)."""
+    choice = await ask_choice(
+        event,
+        f"🤔 Не понимаю, что это за файл: «{filename}».\nКуда его положить?",
+        [[("🎵 Музыка", "music"), ("🎬 Фильм", "movie")], [("✖️ Отмена", "cancel")]],
+        KIND_ALIASES,
+        "1 — музыка, 2 — фильм, 0 — отмена",
+        _kind_note,
+    )
+    return choice if choice in KIND_LABELS else None
+
+
+async def on_choice_button(event):
     """Нажатие кнопки у бота-помощника."""
     if not sender_allowed(event.sender_id):
         await event.answer("Нет доступа", alert=True)
         return
     try:
-        _, token, choice = event.data.decode().split(":", 2)
+        _, token, value = event.data.decode().split(":", 2)
     except ValueError:
         return
-    fut = PENDING_CHOICES.get(("cb", token))
-    if fut is None or fut.done():
+    entry = PENDING_CHOICES.get(("cb", token))
+    if entry is None or entry[0].done():
         await event.answer("Этот вопрос уже неактуален")
         return
-    fut.set_result(choice)
+    entry[0].set_result(value)
     await event.answer("Принято")
 
 
@@ -1422,7 +1459,7 @@ async def start_buttons_bot() -> None:
         connection_retries=-1, retry_delay=2, auto_reconnect=True,
     )
     candidate.parse_mode = None
-    candidate.add_event_handler(on_kind_button, events.CallbackQuery(pattern=rb"^kind:"))
+    candidate.add_event_handler(on_choice_button, events.CallbackQuery(pattern=rb"^ask:"))
     candidate.add_event_handler(on_helper_start, events.NewMessage(pattern=r"^/start", incoming=True))
     try:
         await candidate.start(bot_token=BUTTONS_BOT_TOKEN)
@@ -1436,6 +1473,313 @@ async def start_buttons_bot() -> None:
     log.info("Бот-помощник для кнопок запущен: @%s", me.username)
 
 
+# ---------- управление музыкальной библиотекой (через beets) ----------
+# Бот вызывает консольный «beet» с тем же конфигом, что и импорт, поэтому база beets и файлы не расходятся.
+# Нужно: beets в образе бота (ТОЙ ЖЕ версии, что и в контейнере импорта) и общие папки библиотеки и конфига,
+# смонтированные по тем же путям (в базе лежат абсолютные пути).
+class LibraryError(Exception):
+    """Понятная пользователю причина сбоя команды библиотеки."""
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+LIB_SEP = "\x1f"
+# В beets 2.x жанры — список в поле «genres» (поле «genre» осталось только как синоним при записи).
+LIB_KEYS = ("id", "artist", "title", "album", "genres", "year", "format", "bitrate", "path")
+LIB_FORMAT = LIB_SEP.join(f"${k}" for k in LIB_KEYS)
+LIB_SETTABLE = ("artist", "title", "album", "albumartist", "genre", "year")  # что разрешено менять через /set
+LIB_FIELD_ALIAS = {"genre": "genres"}
+LIB_MAX_LIST = 25
+LIB_MAX_IDS = 20
+
+LIB_HELP = (
+    "🎵 Управление библиотекой:\n"
+    "/find <запрос> — поиск (например: /find scatman)\n"
+    "/last [N] — последние добавленные\n"
+    "/info <id> — подробности о треке\n"
+    "/rename <id> Исполнитель - Название — переименовать (файл переедет сам)\n"
+    "/set <id> поле=значение … — изменить теги: artist, title, album, albumartist, genre, year\n"
+    "/del <id> [id …] — удалить треки вместе с файлами (спрошу подтверждение)\n"
+    "/stats — статистика библиотеки\n"
+    "/rescan — пересканировать Navidrome"
+)
+
+
+async def run_beet(*args: str) -> str:
+    """Запускает «beet» с нашим конфигом, возвращает вывод. Ошибки → LibraryError.
+    Пользовательский текст передаётся только отдельными аргументами (без shell) и после «--» там, где это запросы."""
+    cmd = [BEETS_BIN, "-c", BEETS_CONFIG, "-p", BEETS_PLUGINS, *args]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except FileNotFoundError:
+        raise LibraryError("в контейнере бота не установлен beets (команда «%s» не найдена)" % BEETS_BIN) from None
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=BEETS_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        raise LibraryError(f"beets не ответил за {BEETS_TIMEOUT_SEC} сек") from None
+    text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace"))
+    lines = [ln for ln in text.splitlines() if not ln.startswith("Created database backup")]
+    if proc.returncode != 0:
+        tail = "\n".join(lines).strip()[-300:]
+        log.warning("beet %s -> код %s: %s", " ".join(args[:2]), proc.returncode, tail)
+        raise LibraryError(tail or f"beets завершился с кодом {proc.returncode}")
+    return "\n".join(lines)
+
+
+def parse_items(output: str) -> list:
+    items = []
+    for line in output.splitlines():
+        parts = line.split(LIB_SEP)
+        if len(parts) == len(LIB_KEYS) and parts[0].isdigit():
+            items.append(dict(zip(LIB_KEYS, parts)))
+    return items
+
+
+async def find_items(terms: list) -> list:
+    # «--»: всё дальше — запрос, даже если слово начинается с «-».
+    return parse_items(await run_beet("ls", "-f", LIB_FORMAT, "--", *terms))
+
+
+async def get_item(item_id: int) -> Optional[dict]:
+    found = await find_items([f"id:{item_id}"])
+    return found[0] if found else None
+
+
+def split_args(text: str) -> list:
+    try:
+        return shlex.split(text)
+    except ValueError:  # незакрытая кавычка
+        return text.split()
+
+
+def parse_ids(text: str) -> list:
+    ids = []
+    for tok in re.split(r"[\s,]+", text.strip()):
+        if not tok:
+            continue
+        if not tok.isdigit():
+            raise LibraryError(f"«{tok}» — это не id трека (id — число из /find или /last)")
+        if int(tok) not in ids:
+            ids.append(int(tok))
+    if len(ids) > LIB_MAX_IDS:
+        raise LibraryError(f"за раз можно не больше {LIB_MAX_IDS} треков")
+    return ids
+
+
+def item_line(it: dict) -> str:
+    album = f" · {it['album']}" if it["album"] else ""
+    return f"#{it['id']} · {it['artist'] or '—'} — {it['title'] or '—'}{album}"
+
+
+def format_items(items: list, header: str) -> str:
+    if not items:
+        return "🤷 Ничего не найдено."
+    shown = items[:LIB_MAX_LIST]
+    text = header + "\n" + "\n".join(item_line(it) for it in shown)
+    if len(items) > len(shown):
+        text += f"\n…и ещё {len(items) - len(shown)} — уточните запрос."
+    return text + "\n\n/info <id> · /rename <id> … · /del <id>"
+
+
+def item_details(it: dict) -> str:
+    try:
+        bitrate = f"{int(it['bitrate']) // 1000} кбит/с"
+    except ValueError:
+        bitrate = it["bitrate"] or "—"
+    year = it["year"] if it["year"].strip("0") else "—"  # у трека без года beets отдаёт «0000»
+    rows = [
+        f"#{it['id']} · {it['artist'] or '—'} — {it['title'] or '—'}",
+        f"Альбом: {it['album'] or '—'}",
+        f"Жанр: {it['genres'] or '—'} · Год: {year}",
+        f"Формат: {it['format'] or '—'} · {bitrate}",
+        f"Файл: {it['path']}",
+    ]
+    return "\n".join(rows)
+
+
+async def navidrome_scan() -> Optional[bool]:
+    """None — Navidrome не настроен; True/False — удалось ли запустить сканирование."""
+    if not (NAVIDROME_USER and NAVIDROME_PASS):
+        return None
+    salt = uuid.uuid4().hex[:8]
+    params = {
+        "u": NAVIDROME_USER,
+        "t": hashlib.md5((NAVIDROME_PASS + salt).encode()).hexdigest(),  # токен Subsonic API, пароль в URL не уходит
+        "s": salt, "v": "1.16.1", "c": "userbot", "f": "json", "fullScan": "true",
+    }
+    try:
+        r = await http.get(f"{NAVIDROME_URL.rstrip('/')}/rest/startScan.view", params=params, timeout=15)
+        ok = r.status_code == 200 and r.json().get("subsonic-response", {}).get("status") == "ok"
+    except Exception as e:
+        log.warning("Navidrome не ответил на запрос сканирования: %s", e)
+        return False
+    if not ok:
+        log.warning("Navidrome отклонил запрос сканирования (%s)", r.status_code)
+    return ok
+
+
+def scan_note(scan: Optional[bool]) -> str:
+    if scan is True:
+        return "\n🔄 Сканирование Navidrome запущено."
+    if scan is False:
+        return "\n⚠️ Navidrome не ответил — запустите сканирование вручную."
+    return ""
+
+
+async def cmd_help(event, rest: str) -> None:
+    await event.reply(LIB_HELP)
+
+
+async def cmd_find(event, rest: str) -> None:
+    terms = split_args(rest)
+    if not terms:
+        await event.reply("Что искать? Например: /find scatman")
+        return
+    items = await find_items(terms)
+    await event.reply(format_items(items, f"🔎 Найдено: {len(items)}"))
+
+
+async def cmd_last(event, rest: str) -> None:
+    n = int(rest) if rest.strip().isdigit() else 10
+    n = max(1, min(n, LIB_MAX_LIST))
+    items = (await find_items(["added-"]))[:n]  # «added-» — сортировка по дате добавления, новые сверху
+    await event.reply(format_items(items, f"🕒 Последние {len(items)}:"))
+
+
+async def cmd_info(event, rest: str) -> None:
+    ids = parse_ids(rest)
+    if len(ids) != 1:
+        await event.reply("Укажите один id: /info 123")
+        return
+    it = await get_item(ids[0])
+    await event.reply(item_details(it) if it else f"🤷 Трека #{ids[0]} нет в библиотеке.")
+
+
+async def apply_changes(event, item_id: int, changes: dict, what: str) -> None:
+    if await get_item(item_id) is None:
+        raise LibraryError(f"трека #{item_id} нет в библиотеке")
+    # «поле=значение» — один аргумент; -y: без вопроса «Really modify?». Файл переименуется по шаблону путей beets.
+    await run_beet("modify", "-y", f"id:{item_id}", *[f"{k}={v}" for k, v in changes.items()])
+    it = await get_item(item_id)
+    scan = await navidrome_scan()
+    text = f"✅ {what}\n{item_details(it)}" if it else f"✅ {what}"
+    await event.reply(text + scan_note(scan))
+
+
+async def cmd_rename(event, rest: str) -> None:
+    m = re.match(r"^(\d+)\s+(.+?)\s+-\s+(.+)$", normalize_text(rest).strip())
+    if not m:
+        await event.reply("Формат: /rename <id> Исполнитель - Название\nНапример: /rename 12 Scatman John - Scatman")
+        return
+    changes = {"artist": m.group(2).strip(), "title": m.group(3).strip()}
+    await apply_changes(event, int(m.group(1)), changes, "Переименовано.")
+
+
+async def cmd_set(event, rest: str) -> None:
+    tokens = split_args(normalize_text(rest))
+    usage = 'Формат: /set <id> поле=значение …\nНапример: /set 12 album="Best Of" year=1995'
+    if len(tokens) < 2 or not tokens[0].isdigit():
+        await event.reply(usage)
+        return
+    changes = {}
+    for tok in tokens[1:]:
+        key, sep, value = tok.partition("=")
+        key = key.strip().lower()
+        if not sep or key not in LIB_SETTABLE:
+            raise LibraryError(f"не понял «{tok}». Можно менять: {', '.join(LIB_SETTABLE)}")
+        if key == "year" and not value.isdigit():
+            raise LibraryError("год должен быть числом")
+        changes[LIB_FIELD_ALIAS.get(key, key)] = value.strip()  # жанры несколько: «Rock; Metal»
+    await apply_changes(event, int(tokens[0]), changes, "Теги изменены.")
+
+
+def _delete_note(choice: Optional[str]) -> str:
+    if choice == "yes":
+        return "🗑 Удаляю…"
+    if choice is None:
+        return "⌛ Ответа не дождался — ничего не удалено."
+    return "✖️ Отменено, ничего не удалено."
+
+
+async def cmd_del(event, rest: str) -> None:
+    ids = parse_ids(rest)
+    if not ids:
+        await event.reply("Формат: /del <id> [id …]")
+        return
+    items = [it for it in [await get_item(i) for i in ids] if it]
+    if not items:
+        await event.reply("🤷 Таких треков нет в библиотеке.")
+        return
+    listing = "\n".join(item_line(it) for it in items)
+    answer = await ask_choice(
+        event,
+        f"🗑 Удалить навсегда ({len(items)})?\n{listing}\nФайлы тоже удалятся с диска.",
+        [[("🗑 Удалить", "yes"), ("✖️ Отмена", "cancel")]],
+        YES_ALIASES,
+        "да — удалить, нет — отмена",
+        _delete_note,
+    )
+    if answer != "yes":
+        return
+    done = 0
+    problems = []
+    for it in items:
+        try:
+            await run_beet("remove", "-d", "-f", f"id:{it['id']}")  # -d: и файл с диска; -f: без вопроса
+            done += 1
+        except LibraryError as e:
+            problems.append(f"#{it['id']}: {e}")
+    scan = await navidrome_scan() if done else None
+    text = f"✅ Удалено: {done} из {len(items)}." + scan_note(scan)
+    if problems:
+        text += "\n⚠️ Не удалось:\n" + "\n".join(problems)
+    await event.reply(text)
+
+
+async def cmd_stats(event, rest: str) -> None:
+    await event.reply("📊 " + (await run_beet("stats")).strip())
+
+
+async def cmd_rescan(event, rest: str) -> None:
+    scan = await navidrome_scan()
+    if scan is None:
+        await event.reply("Navidrome не настроен (NAVIDROME_USER / NAVIDROME_PASS).")
+    else:
+        await event.reply(scan_note(scan).strip())
+
+
+LIBRARY_COMMANDS = {
+    "/help": cmd_help, "/start": cmd_help,
+    "/find": cmd_find, "/last": cmd_last, "/info": cmd_info,
+    "/rename": cmd_rename, "/set": cmd_set, "/del": cmd_del,
+    "/stats": cmd_stats, "/rescan": cmd_rescan,
+}
+
+
+async def handle_library_command(event) -> None:
+    cmd, _, rest = event.raw_text.strip().partition(" ")
+    handler = LIBRARY_COMMANDS.get(cmd.split("@")[0].lower())
+    if handler is None:
+        return
+    if not LIBRARY_ADMIN:
+        await event.reply("🔒 Управление библиотекой выключено (LIBRARY_ADMIN=0).")
+        return
+    try:
+        await handler(event, rest.strip())
+    except LibraryError as e:
+        await event.reply(f"❌ {e}")
+    except Exception as e:
+        log.exception("library command failed")
+        await event.reply(f"❌ Не получилось: {describe_error(e)}.")
+
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_dm(event):
     if not event.is_private:
@@ -1447,7 +1791,10 @@ async def handle_dm(event):
 
     doc = event.document
     if not event.media or not doc:
-        resolve_text_choice(event)  # может быть ответом «1/2/0» на вопрос бота
+        if resolve_text_choice(event):  # ответ на вопрос бота («1/2/0», «да/нет»)
+            return
+        if event.raw_text and event.raw_text.startswith("/"):
+            await handle_library_command(event)
         return
 
     attrs = doc.attributes or []
@@ -1575,6 +1922,11 @@ async def main():
         timeout=HTTP_DEFAULT_TIMEOUT,
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=4),
     )
+    if LIBRARY_ADMIN:
+        if not shutil.which(BEETS_BIN):
+            log.warning("Управление библиотекой: «%s» не найден — команды /find, /del и т.д. работать не будут", BEETS_BIN)
+        elif not Path(BEETS_CONFIG).exists():
+            log.warning("Управление библиотекой: нет конфига %s — смонтируйте папку с конфигом beets", BEETS_CONFIG)
     try:
         await start_buttons_bot()
         await client.start()
