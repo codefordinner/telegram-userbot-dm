@@ -8,12 +8,23 @@ Userbot: принимает в личку музыку/видео и залив�
   * TMP_DIR            — куда качать временные файлы (по умолчанию /tmp/userbot-uploader)
   * CHECK_DISK         — проверять свободное место перед скачиванием (1/0, по умолчанию 1)
   * MIN_FREE_DISK_GB   — сколько ГБ должно остаться свободным после записи (по умолчанию 1.5)
-  * STALL_TIMEOUT_SEC  — сколько секунд без прогресса считать зависанием (по умолчанию 180, 0 = выкл.)
+  * STALL_TIMEOUT_SEC  — сколько секунд без прогресса считать зависанием (по умолчанию 180, 0 = выкл.);
+                         зависшая попытка перезапускается (с докачкой), а не валит всю передачу
+  * UPLOAD_VIA_TEMP    — грузить на copyparty во временный файл и переименовывать (WebDAV MOVE) после проверки
+                         размера (1/0, по умолчанию 1). Нужны права move (а для замены существующего
+                         файла ещё и delete) у пользователя copyparty; права бот узнаёт сам через ?ls
+  * CAPTION_NAMING     — откуда брать имя файла: auto (по умолчанию: подпись, если имя из Telegram
+                         неинформативно), always (всегда подпись), never (всегда имя из Telegram)
+  * MAX_FLOOD_WAIT_SEC — суммарно сколько секунд ждать FloodWait на одну загрузку (по умолчанию 600)
+  * CATCH_UP           — подтягивать сообщения, пришедшие, пока бот был выключен (1/0, по умолчанию 1)
+  * AMBIGUOUS_MIN_MB   — «.ts» считаем видео (а не TypeScript), только если файл не меньше N МБ
+                         или у него есть видео-атрибуты Telegram (по умолчанию 5)
 """
 import asyncio
 import contextlib
 import errno
 import functools
+import inspect
 import logging
 import mimetypes
 import os
@@ -21,6 +32,8 @@ import re
 import shutil
 import time
 import unicodedata
+import uuid
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +43,7 @@ from urllib.parse import quote
 import httpx
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.tl import types as tl_types
 from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeFilename,
@@ -76,7 +90,18 @@ TARGETS = {
 }
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".m4v"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+# «.ts» — это и MPEG-TS, и TypeScript (Telegram даже присылает его как video/mp2t), поэтому
+# видео считаем только при наличии видео-атрибутов или достаточного размера.
+AMBIGUOUS_VIDEO_EXTS = {".ts"}
+AMBIGUOUS_MIN_BYTES = int(float(os.environ.get("AMBIGUOUS_MIN_MB", "5")) * 1024 * 1024)
+
+# GIF-анимации и стикеры (в т.ч. видеостикеры и кастомные эмодзи) — это тоже mp4/webm, но не медиатека.
+JUNK_ATTR_TYPES = tuple(
+    getattr(tl_types, name)
+    for name in ("DocumentAttributeAnimated", "DocumentAttributeSticker", "DocumentAttributeCustomEmoji")
+    if hasattr(tl_types, name)
+)
 
 MIME_EXT = {
     "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
@@ -89,6 +114,8 @@ MIME_EXT = {
 UPLOAD_RETRIES = 3
 DOWNLOAD_RETRIES = 3
 MAX_FLOOD_WAITS = 5
+# Суммарный потолок ожидания FloodWait на одну загрузку: пока бот ждёт, он занимает слот очереди.
+MAX_FLOOD_WAIT_SEC = int(os.environ.get("MAX_FLOOD_WAIT_SEC", "600"))
 RETRY_BACKOFF_SEC = 5
 PROGRESS_EDIT_INTERVAL_SEC = 4
 SPEED_WINDOW_SEC = 15  # скорость и ETA считаем по скользящему окну, а не по среднему с начала
@@ -106,6 +133,22 @@ UPLOAD_SEMAPHORE: Optional[asyncio.Semaphore] = None  # создаётся в ma
 # Зависанием считаем отсутствие прогресса дольше этого времени (держит слот в семафоре).
 STALL_TIMEOUT_SEC = int(os.environ.get("STALL_TIMEOUT_SEC", "180"))
 WATCHDOG_TICK_SEC = 5
+
+# Загрузка на copyparty: сначала во временный файл, потом переименование (иначе обрыв оставляет на
+# сервере битый файл, а повторная загрузка поверх существующего создаёт копию «имя-<время>-<id>.mp3»).
+UPLOAD_VIA_TEMP = env_flag("UPLOAD_VIA_TEMP", True)
+PERMS_TTL_SEC = 3600  # как долго помнить права пользователя copyparty
+OK_MOVE_STATUSES = {200, 201, 204}
+# copyparty на отсутствие права move/delete отвечает 401 (не 403!); 405/501 — метод не поддерживается.
+MOVE_DENIED_STATUSES = {401, 403, 405, 501}
+
+# Откуда брать имя файла: подпись к сообщению или имя из Telegram (см. should_use_caption).
+CAPTION_NAMING = os.environ.get("CAPTION_NAMING", "auto").strip().lower()
+if CAPTION_NAMING not in ("auto", "always", "never"):
+    CAPTION_NAMING = "auto"
+
+# Догонять сообщения, пришедшие, пока бот был выключен.
+CATCH_UP = env_flag("CATCH_UP", True)
 
 # Какие HTTP-статусы считаем успешной загрузкой и какие ошибки имеет смысл повторять.
 OK_UPLOAD_STATUSES = {200, 201, 204}
@@ -139,6 +182,13 @@ TMP_DIR = Path(os.environ.get("TMP_DIR", "/tmp/userbot-uploader"))
 CHECK_DISK = env_flag("CHECK_DISK", True)
 MIN_FREE_DISK_AFTER_BYTES = int(float(os.environ.get("MIN_FREE_DISK_GB", "1.5")) * 1024 ** 3)
 
+_client_kwargs = {}
+if CATCH_UP:
+    if "catch_up" in inspect.signature(TelegramClient.__init__).parameters:
+        _client_kwargs["catch_up"] = True
+    else:
+        log.warning("Эта версия Telethon не поддерживает catch_up — пропущенные сообщения догонять не буду")
+
 client = TelegramClient(
     SESSION_PATH,
     API_ID,
@@ -146,7 +196,10 @@ client = TelegramClient(
     connection_retries=-1,  # переподключаться бесконечно, а не сдаваться после 5 попыток
     retry_delay=2,
     auto_reconnect=True,
+    **_client_kwargs,
 )
+# Статусы показывают имена файлов «как есть»: [Remix](2020), __x__ и т.п. не должны разбираться как Markdown.
+client.parse_mode = None
 
 # Общий httpx-клиент (создаётся в main()): переиспользует соединения вместо нового на каждый запрос.
 http: Optional[httpx.AsyncClient] = None
@@ -179,10 +232,22 @@ class TransferState:
 class TransferError(Exception):
     """Ошибка с понятной пользователю причиной."""
 
-    def __init__(self, user_message: str, retriable: bool = False):
+    def __init__(self, user_message: str, retriable: bool = False, retry_after: Optional[float] = None):
         super().__init__(user_message)
         self.user_message = user_message
         self.retriable = retriable
+        self.retry_after = retry_after  # пауза перед повтором, если её потребовал сервер
+
+
+class StallError(TransferError):
+    """Нет прогресса дольше STALL_TIMEOUT_SEC. Повторяемая: зависшую попытку просто перезапускаем."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"нет прогресса больше {int(seconds)} сек (зависание)", retriable=True)
+
+
+class RenameUnsupported(TransferError):
+    """copyparty не разрешил переименовать временный файл (нет права move/delete или метод не поддерживается)."""
 
 
 ACTIVE_TRANSFERS = set()
@@ -232,12 +297,15 @@ def remove_quietly(path: Path) -> None:
         path.unlink()
 
 
-def classify(filename: str, mime_type: Optional[str] = None):
+def classify(filename: str, mime_type: Optional[str] = None, size: int = 0, has_video_attr: bool = False):
     ext = Path(filename).suffix.lower()
     if ext in AUDIO_EXTS:
         return "music"
     if ext in VIDEO_EXTS:
         return "movie"
+    if ext in AMBIGUOUS_VIDEO_EXTS:
+        # По mime тут не отличить (TypeScript тоже «video/mp2t»), поэтому смотрим на атрибуты и размер.
+        return "movie" if (has_video_attr or size >= AMBIGUOUS_MIN_BYTES) else None
     # Расширение не распознали — подстрахуемся по mime_type, если Telegram его прислал.
     if mime_type:
         if mime_type.startswith("audio/"):
@@ -252,6 +320,21 @@ def ext_from_mime(mime_type: Optional[str]) -> str:
         return ""
     mime_type = mime_type.lower()
     return MIME_EXT.get(mime_type) or mimetypes.guess_extension(mime_type) or ""
+
+
+_VALID_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,5}")
+
+
+def ensure_extension(filename: str, kind: str, mime_type: Optional[str]) -> tuple:
+    """Гарантирует нормальное расширение. Возвращает (имя_файла, расширение).
+
+    Если «расширения» нет или это обрывок названия («Mr. Brightside» → суффикс «. Brightside»),
+    расширение ДОПИСЫВАЕТСЯ к имени целиком, а не подменяет суффикс — иначе часть названия теряется."""
+    ext = Path(filename).suffix
+    if _VALID_EXT_RE.fullmatch(ext):
+        return filename, ext
+    ext = ext_from_mime(mime_type) or (".mp4" if kind == "movie" else ".mp3")
+    return filename + ext, ext
 
 
 # ---------- имена файлов и кодировки ----------
@@ -289,21 +372,44 @@ def truncate_filename(name: str, max_bytes: int = MAX_FILENAME_BYTES) -> str:
     return (stem or "file") + ext
 
 
-_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґЎў]")
+_CYRILLIC_VOWEL_RE = re.compile(r"[аеёиоуыэюяіїє]", re.IGNORECASE)
 
 
-def _fix_cp1251_word(word: str) -> str:
-    """Слово из cp1251-байтов, прочитанных как Latin-1 («Èãîðü» → «Игорь»)."""
+def _decode_cp1251_word(word: str) -> Optional[tuple]:
+    """Слово из cp1251-байтов, прочитанных как Latin-1 («Èãîðü» → «Игорь»).
+    Возвращает (исправленное_слово, число_букв) или None, если слово не похоже на такой мусор."""
     letters = [c for c in word if c.isalpha()]
     if len(letters) < 2 or not all(0x80 <= ord(c) <= 0xFF for c in letters):
-        return word  # есть ASCII-буквы или «настоящие» не-latin1 символы — не наш случай
+        return None  # есть ASCII-буквы или «настоящие» не-latin1 символы — не наш случай
     try:
         fixed = word.encode("latin-1").decode("cp1251")
     except (UnicodeEncodeError, UnicodeDecodeError):
-        return word
-    if all(_CYRILLIC_RE.fullmatch(c) for c in fixed if c.isalpha()):
-        return fixed
-    return word
+        return None
+    fixed_letters = [c for c in fixed if c.isalpha()]
+    if not fixed_letters or not all(_CYRILLIC_RE.fullmatch(c) for c in fixed_letters):
+        return None
+    core = "".join(fixed_letters)
+    # У настоящего русского слова из 3+ букв есть гласная; «äöü» → «дць» — это просто немецкие умлауты.
+    if len(core) >= 3 and not _CYRILLIC_VOWEL_RE.search(core):
+        return None
+    return fixed, len(core)
+
+
+def _fix_cp1251_text(text: str) -> str:
+    fixes = {}
+    for m in re.finditer(r"\S+", text):
+        word = m.group(0)
+        if word not in fixes:
+            res = _decode_cp1251_word(word)
+            if res:
+                fixes[word] = res
+    # Кракозябры от cp1251 — это целые фразы. Без хотя бы одного «длинного» слова (3+ буквы) ничего
+    # не трогаем: одинокое «ñó» — вполне законный текст, а не «су». Короткие слова («íå» → «не»)
+    # чиним только рядом с таким длинным.
+    if not any(n >= 3 for _, n in fixes.values()):
+        return text
+    return re.sub(r"\S+", lambda m: fixes[m.group(0)][0] if m.group(0) in fixes else m.group(0), text)
 
 
 def fix_mojibake(text: str) -> str:
@@ -318,7 +424,7 @@ def fix_mojibake(text: str) -> str:
             continue
         if fixed != text:
             return fixed
-    return re.sub(r"\S+", lambda m: _fix_cp1251_word(m.group(0)), text)
+    return _fix_cp1251_text(text)
 
 
 def clean_filename(name: str) -> str:
@@ -427,6 +533,19 @@ async def safe_edit(message, text: str) -> bool:
 _QUALITY_RE = re.compile(r"\[(\d{3,4}[pi]|[48]k)\]", re.IGNORECASE)
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 
+# Рекламная/служебная строка источника: @канал, ссылки, #хэштег, «pesni.fm», «скачать…». Её нельзя
+# принимать за название, иначе файл превратится в «Скачать тут - @channel.mp3».
+_AD_RE = re.compile(
+    r"@\w|https?://|t\.me/|www\.|(?<!\w)#[^\W\d_]"
+    r"|[\w-]{2,}\.(?:com|ru|net|org|fm|me|su|ua|by|io|cc|ly|tv)\b"
+    r"|скача[йт]|подпис(?:ывайся|ывайтесь|ись)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_ad(line: str) -> bool:
+    return bool(_AD_RE.search(line))
+
 
 def parse_video_caption(text: str):
     if not text:
@@ -439,6 +558,8 @@ def parse_video_caption(text: str):
 
     title_line = lines[0]
     extra_lines = lines[1:]
+    if looks_like_ad(title_line):
+        return None  # первая строка — реклама, а не название: оставляем имя файла из Telegram
 
     # Качество вида [1080p] может стоять и внутри скобок, и после них — вырезаем его в любом случае.
     q = _QUALITY_RE.search(title_line)
@@ -510,6 +631,8 @@ def parse_music_caption(text: str):
     first = lines[0]
     # убираем служебные пометки в скобках вроде "(в файле)", не трогая содержательные
     first = re.sub(r"\(\s*в\s*файле\s*\)", "", first, flags=re.IGNORECASE).strip()
+    if looks_like_ad(first):
+        return None  # первая строка — реклама, а не «Исполнитель - Название»
 
     m = re.match(r"^(.+?)\s+-\s+(.+)$", first)
     if not m:
@@ -525,6 +648,49 @@ def parse_music_caption(text: str):
 
 def build_filename_from_music_caption(parsed: dict, ext: str) -> str:
     return f"{parsed['artist']} - {parsed['title']}{ext}"
+
+
+# ---------- что победит: подпись или имя файла из Telegram ----------
+_GENERIC_NAME_WORDS = {
+    "", "audio", "audiofile", "video", "videofile", "file", "document", "doc", "track", "music", "song",
+    "movie", "film", "voice", "telegram", "tg", "vid", "mov", "untitled", "unknown", "noname",
+    "аудио", "видео", "файл", "трек", "музыка", "фильм", "безназвания",
+}
+_FILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{20,}")
+_EPISODE_IN_NAME_RE = re.compile(r"(?<![A-Za-z0-9])S\d{1,2}E\d{1,3}(?![0-9])|(?<![A-Za-z0-9])\d{1,2}x\d{2,3}(?![A-Za-z0-9])", re.IGNORECASE)
+_LETTER_RE = re.compile(r"[^\W\d_]")
+
+
+def is_generic_name(stem: str) -> bool:
+    """«audio_123», «Telegram 2024-01-01 12.00.00», «AgADxxxxxxxxxxxxxxxxx» — имя, из которого ничего не узнать."""
+    core = re.sub(r"[\d\W_]+", "", stem.lower())
+    if core in _GENERIC_NAME_WORDS:
+        return True
+    return bool(_FILE_ID_RE.fullmatch(stem) and re.search(r"\d", stem))
+
+
+def should_use_caption(kind: str, orig_filename: str, parsed: dict) -> bool:
+    """Подпись должна перебивать имя из Telegram не всегда: если файл уже называется нормально
+    («Исполнитель - Название.mp3», «Film.2021.1080p.mkv»), подпись с рекламой или шумом его только испортит.
+    Режим задаётся CAPTION_NAMING: auto (по умолчанию) / always / never."""
+    if CAPTION_NAMING == "never":
+        return False
+    if CAPTION_NAMING == "always":
+        return True
+    stem = Path(orig_filename).stem
+    if is_generic_name(stem):
+        return True
+    if kind == "music":
+        m = re.match(r"^(.+?)\s+-\s+(.+)$", stem)
+        informative = bool(m and _LETTER_RE.search(m.group(1)) and _LETTER_RE.search(m.group(2)))
+        return not informative
+    # фильм/сериал
+    has_episode = bool(_EPISODE_IN_NAME_RE.search(stem))
+    if parsed.get("season") is not None and parsed.get("episode") is not None:
+        return not has_episode  # подпись знает серию, а имя файла — нет
+    if has_episode:
+        return False
+    return not (_YEAR_RE.search(stem) and len(_LETTER_RE.findall(stem)) >= 3)
 
 
 # ---------- ID3-теги mp3 ----------
@@ -663,7 +829,9 @@ async def progress_updater(status, state: TransferState, stop_event: asyncio.Eve
 
 
 async def with_stall_watchdog(coro, state: TransferState):
-    """Выполняет coro; если прогресс не меняется дольше STALL_TIMEOUT_SEC — отменяет её с понятной ошибкой.
+    """Выполняет coro; если прогресс не меняется дольше STALL_TIMEOUT_SEC — отменяет её и бросает StallError.
+    Вызывается на КАЖДУЮ попытку (скачать / отправить), а не на всю передачу: StallError повторяемая,
+    поэтому зависшая попытка просто перезапускается (скачивание — с докачкой), а не валит передачу целиком.
     Так подвисший Telegram/copyparty не держит слот в семафоре вечно."""
     if STALL_TIMEOUT_SEC <= 0:
         return await coro
@@ -685,13 +853,13 @@ async def with_stall_watchdog(coro, state: TransferState):
                 continue
             if now - last_move > STALL_TIMEOUT_SEC:
                 task.cancel()
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-                raise TransferError(f"таймаут: нет прогресса больше {STALL_TIMEOUT_SEC} сек")
+                raise StallError(STALL_TIMEOUT_SEC)
     finally:
         if not task.done():
             task.cancel()
-            with contextlib.suppress(BaseException):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
 
@@ -699,7 +867,7 @@ async def with_stall_watchdog(coro, state: TransferState):
 async def refresh_message(message):
     """Перечитываем сообщение: file reference в старом объекте мог протухнуть."""
     try:
-        fresh = await client.get_messages(message.chat_id, ids=message.id)
+        fresh = await asyncio.wait_for(client.get_messages(message.chat_id, ids=message.id), timeout=30)
         return fresh or message
     except Exception as e:
         log.debug("Не удалось обновить сообщение: %s", e)
@@ -745,31 +913,46 @@ async def download_resumable(message, local_path: Path, state: TransferState, at
 
 
 async def download_with_retry(message, local_path: Path, state: TransferState) -> None:
-    """Скачивание из Telegram с повторными попытками (с докачкой) и корректной обработкой FloodWaitError
-    (ждём ровно столько, сколько просит Telegram, не тратя на это обычный лимит попыток)."""
+    """Скачивание из Telegram с повторными попытками.
+    * Каждая попытка идёт под своим watchdog-ом: зависание — это повторяемая ошибка. Недокачанный файл
+      остаётся на диске, и следующая попытка продолжает с последней выровненной границы.
+    * FloodWait ждём ровно столько, сколько просит Telegram, не тратя обычный лимит попыток, но суммарно
+      не дольше MAX_FLOOD_WAIT_SEC — на время ожидания мы занимаем слот очереди."""
     last_exc = None
     attempt = 0
     flood_waits = 0
+    flood_budget = MAX_FLOOD_WAIT_SEC
+    need_refresh = False  # после сбоя/долгого ожидания file reference мог протухнуть
     while attempt < DOWNLOAD_RETRIES:
         attempt += 1
         state.attempt = attempt
         try:
-            if attempt > 1:
+            if need_refresh:
                 message = await refresh_message(message)
-            await download_resumable(message, local_path, state, attempt)
+            await with_stall_watchdog(download_resumable(message, local_path, state, attempt), state)
             return
         except asyncio.CancelledError:
             raise
         except FloodWaitError as e:
             flood_waits += 1
-            if flood_waits > MAX_FLOOD_WAITS:
-                raise
-            log.warning("Telegram просит подождать %s сек (FloodWait), ждём и пробуем снова", e.seconds)
+            wait = e.seconds + 1
+            if flood_waits > MAX_FLOOD_WAITS or wait > flood_budget:
+                raise TransferError(
+                    f"Telegram просит подождать {e.seconds} сек (FloodWait) — слишком долго или слишком "
+                    f"часто, попробуйте позже"
+                ) from e
+            flood_budget -= wait
+            log.warning(
+                "Telegram просит подождать %s сек (FloodWait), ждём и пробуем снова (бюджет ожидания: ещё %s сек)",
+                e.seconds, flood_budget,
+            )
             attempt -= 1  # честный FloodWait не считаем за неудачную попытку
             last_exc = e
-            await sleep_waiting(state, e.seconds + 1)
+            need_refresh = True
+            await sleep_waiting(state, wait)
         except Exception as e:
             last_exc = e
+            need_refresh = True
             log.warning("Попытка скачивания %s/%s не удалась: %s", attempt, DOWNLOAD_RETRIES, e)
             if attempt < DOWNLOAD_RETRIES:
                 await sleep_waiting(state, RETRY_BACKOFF_SEC * attempt)
@@ -817,58 +1000,235 @@ def parse_retry_after(resp: httpx.Response) -> Optional[float]:
         return None
 
 
-async def upload_with_retry(url, user, pw, filename, local_path: Path, state: TransferState) -> None:
-    """PUT с повторами. Успех — только 200/201/204 и совпавший размер на сервере.
-    Повторяем сетевые ошибки и временные статусы (5xx, 408, 429), остальные 4xx — сразу ошибка."""
-    file_size = local_path.stat().st_size
-    target = remote_url(url, filename)
-    last_error: Optional[BaseException] = None
+# Права пользователя copyparty (из «?ls»): нужны, чтобы заранее понять, можно ли переименовывать/заменять файлы.
+_PERMS_CACHE: dict = {}
+# Параллельные загрузки в одно и то же имя выстраиваем в очередь (ключ — URL файла); записи живут,
+# пока кто-то держит замок.
+_NAME_LOCKS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
 
-    for attempt in range(1, UPLOAD_RETRIES + 1):
-        state.begin("upload", attempt, current=0, total=file_size)
-        delay = RETRY_BACKOFF_SEC * attempt
-        stream = upload_stream(local_path, state)
-        try:
-            resp = await http.put(
-                target,
+
+def name_lock(key: str) -> asyncio.Lock:
+    lock = _NAME_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _NAME_LOCKS[key] = lock
+    return lock
+
+
+def new_temp_name() -> str:
+    # Короткое ASCII-имя без точки в начале: не упирается в лимит длины и не прячется как dotfile.
+    # Расширение «.part» не распознают ни Jellyfin, ни индексатор тегов.
+    return f"upload-{uuid.uuid4().hex[:12]}.part"
+
+
+async def get_remote_perms(url, user, pw) -> Optional[frozenset]:
+    """Права пользователя в этой папке copyparty: {'read','write','move','delete',...}.
+    None — узнать не удалось (тогда действуем оптимистично и полагаемся на ответы сервера)."""
+    now = time.monotonic()
+    hit = _PERMS_CACHE.get(url)
+    if hit and now - hit[0] < PERMS_TTL_SEC:
+        return hit[1]
+    perms = None
+    try:
+        resp = await http.get(f"{url.rstrip('/')}/?ls", auth=(user, pw), timeout=30)
+        if resp.status_code == 200:
+            raw = resp.json().get("perms")
+            if isinstance(raw, list):
+                perms = frozenset(str(p) for p in raw)
+    except (httpx.HTTPError, ValueError) as e:
+        log.debug("Не удалось узнать права на %s: %s", url, e)
+    _PERMS_CACHE[url] = (now, perms)
+    return perms
+
+
+async def delete_remote_quietly(url, user, pw, name) -> bool:
+    """Best-effort удаление с сервера (чистим недозагруженные файлы). True — файла там больше нет."""
+    try:
+        resp = await http.delete(remote_url(url, name), auth=(user, pw), timeout=15)
+    except httpx.HTTPError as e:
+        log.warning("Не удалось удалить «%s» с сервера: %s", name, e)
+        return False
+    if resp.status_code in (200, 202, 204, 404):
+        return True
+    log.warning(
+        "Не удалось удалить «%s» с сервера (%s) — без права delete у пользователя copyparty такие файлы "
+        "придётся убирать вручную", name, resp.status_code,
+    )
+    return False
+
+
+async def _put_file(url, user, pw, name, local_path: Path, file_size: int, state: TransferState) -> httpx.Response:
+    """Один PUT под watchdog-ом: если отправка зависла, он бросит повторяемый StallError."""
+    stream = upload_stream(local_path, state)
+    try:
+        return await with_stall_watchdog(
+            http.put(
+                remote_url(url, name),
                 auth=(user, pw),
                 content=stream,
                 # Явно указываем размер, чтобы не уходить в Transfer-Encoding: chunked —
                 # некоторые связки copyparty/прокси плохо с ним работают.
                 headers={"Content-Length": str(file_size)},
                 timeout=UPLOAD_TIMEOUT,
+            ),
+            state,
+        )
+    finally:
+        await stream.aclose()
+
+
+async def move_remote(url, user, pw, src_name, dst_name, expected_size: int) -> None:
+    """Атомарно (WebDAV MOVE) ставит загруженный временный файл на место, заменяя существующий.
+    Повторяет только само переименование — заново гнать файл ради этого незачем."""
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, 4):
+        try:
+            resp = await http.request(
+                "MOVE",
+                remote_url(url, src_name),
+                auth=(user, pw),
+                headers={"Destination": remote_url(url, dst_name), "Overwrite": "T"},
+                timeout=HTTP_DEFAULT_TIMEOUT,
             )
         except httpx.TransportError as e:
             last_error = e
-            log.warning("Попытка загрузки %s/%s не удалась: %s: %s", attempt, UPLOAD_RETRIES, type(e).__name__, e)
+            log.warning("Переименование: попытка %s/3 не удалась: %s: %s", attempt, type(e).__name__, e)
         else:
-            if resp.status_code in OK_UPLOAD_STATUSES:
-                remote_size = await get_remote_size(url, user, pw, filename)
-                if remote_size is None or remote_size < 0 or remote_size == file_size:
+            code = resp.status_code
+            if code in OK_MOVE_STATUSES:
+                return
+            if code == 404 and attempt > 1:
+                # Предыдущий MOVE мог пройти, а ответ потеряться: источника уже нет, а цель на месте.
+                if await get_remote_size(url, user, pw, dst_name) == expected_size:
                     return
-                last_error = TransferError(
-                    f"размер на сервере ({format_size(remote_size)}) не совпал "
-                    f"с отправленным ({format_size(file_size)})",
-                    retriable=True,
-                )
-                log.warning("Размер после загрузки не совпал: сервер=%s, локально=%s", remote_size, file_size)
-            else:
-                log.error("upload failed: %s %s", resp.status_code, resp.text[:300])
-                err = TransferError(
-                    describe_status(resp.status_code),
-                    retriable=resp.status_code in RETRY_UPLOAD_STATUSES,
-                )
-                if not err.retriable:
-                    raise err
-                last_error = err
-                delay = parse_retry_after(resp) or delay
-        finally:
-            await stream.aclose()
-
-        if attempt < UPLOAD_RETRIES:
-            await sleep_waiting(state, delay)
-
+            (log.warning if code in MOVE_DENIED_STATUSES else log.error)("MOVE failed: %s %s", code, resp.text[:300])
+            if code in MOVE_DENIED_STATUSES:
+                if "delete" in resp.text.lower():
+                    raise TransferError(
+                        "файл с таким именем уже есть на сервере, а заменить его нельзя: "
+                        "у пользователя copyparty нет права delete"
+                    )
+                raise RenameUnsupported("copyparty не разрешает переименование (нужно право move)")
+            last_error = TransferError(
+                f"не удалось переименовать временный файл: {describe_status(code)}",
+                retriable=code in RETRY_UPLOAD_STATUSES,
+            )
+            if not last_error.retriable:
+                raise last_error
+        if attempt < 3:
+            await asyncio.sleep(2 * attempt)
     raise last_error
+
+
+async def _upload_once(url, user, pw, put_name, final_name, local_path: Path, file_size: int, state: TransferState) -> None:
+    """Одна попытка: PUT (во временное или сразу в итоговое имя), проверка размера, при необходимости MOVE.
+    Успех — возврат; сбой — TransferError (retriable или нет) / httpx.TransportError."""
+    resp = await _put_file(url, user, pw, put_name, local_path, file_size, state)
+    if resp.status_code not in OK_UPLOAD_STATUSES:
+        log.error("upload failed: %s %s", resp.status_code, resp.text[:300])
+        raise TransferError(
+            describe_status(resp.status_code),
+            retriable=resp.status_code in RETRY_UPLOAD_STATUSES,
+            retry_after=parse_retry_after(resp),
+        )
+    remote_size = await get_remote_size(url, user, pw, put_name)
+    if remote_size is not None and remote_size >= 0 and remote_size != file_size:
+        log.warning("Размер после загрузки не совпал: сервер=%s, локально=%s", remote_size, file_size)
+        raise TransferError(
+            f"размер на сервере ({format_size(remote_size)}) не совпал с отправленным ({format_size(file_size)})",
+            retriable=True,
+        )
+    if put_name != final_name:
+        await move_remote(url, user, pw, put_name, final_name, file_size)
+
+
+async def upload_with_retry(url, user, pw, filename, local_path: Path, state: TransferState) -> bool:
+    """Заливает файл на copyparty. Возвращает True, если файл с таким именем там уже был (и заменён).
+
+    Схема (UPLOAD_VIA_TEMP=1, по умолчанию): PUT во временный «upload-<id>.part» → проверка размера →
+    MOVE на итоговое имя. Так на сервере никогда не появляется обрезанный файл под настоящим именем,
+    а существующий файл заменяется целиком или остаётся нетронутым. (Прямой PUT поверх существующего copyparty
+    не перезаписывает, а создаёт копию «имя-<время>-<id>.ext»; обрыв оставляет обрезок, и повтор плодит копии.)
+    Если прав move нет — честно грузим напрямую, предварительно убрав обрывки.
+    Повторяем сетевые ошибки, зависания и временные статусы (5xx, 408, 429); остальные 4xx — сразу ошибка."""
+    file_size = local_path.stat().st_size
+    state.begin("upload", 1, current=0, total=file_size)
+    last_error: Optional[BaseException] = None
+    committed = False
+    partial_name: Optional[str] = None  # что стереть с сервера, если загрузка не удалась
+    force_direct = False
+
+    # Одноимённые загрузки идут по очереди: иначе две копии пишут в один путь одновременно.
+    async with name_lock(remote_url(url, filename)):
+        existed = await get_remote_size(url, user, pw, filename) is not None
+        if existed:
+            log.warning("Файл «%s» уже есть на сервере — будет заменён", filename)
+
+        perms = await get_remote_perms(url, user, pw) if UPLOAD_VIA_TEMP else None
+        can_move = perms is None or "move" in perms
+        can_delete = perms is None or "delete" in perms
+        if UPLOAD_VIA_TEMP and existed and not (can_move and can_delete):
+            raise TransferError(
+                "файл с таким именем уже есть на сервере, а заменить его нельзя: "
+                "у пользователя copyparty нет прав move и delete"
+            )
+        use_temp_ok = UPLOAD_VIA_TEMP and can_move
+        if UPLOAD_VIA_TEMP and not can_move:
+            log.warning("У пользователя copyparty нет права move — гружу напрямую, без временного файла")
+
+        try:
+            attempt = 0
+            while attempt < UPLOAD_RETRIES:
+                attempt += 1
+                state.begin("upload", attempt, current=0, total=file_size)
+                delay = RETRY_BACKOFF_SEC * attempt
+                use_temp = use_temp_ok and not force_direct
+                put_name = new_temp_name() if use_temp else filename
+                # Временный файл стираем всегда; «настоящий» — только если до нас его не было.
+                partial_name = put_name if (use_temp or not existed) else None
+                try:
+                    await _upload_once(url, user, pw, put_name, filename, local_path, file_size, state)
+                    committed = True
+                    return existed
+                except RenameUnsupported as e:
+                    # Права, которые показал ?ls, не подтвердились (или поменялись).
+                    _PERMS_CACHE.pop(url, None)
+                    if existed:
+                        raise TransferError(
+                            "файл с таким именем уже есть на сервере, а заменить его нельзя: "
+                            "у пользователя copyparty нет прав move и delete"
+                        ) from e
+                    log.warning("%s — перехожу на прямую загрузку", e)
+                    force_direct = True
+                    await delete_remote_quietly(url, user, pw, put_name)
+                    partial_name = None
+                    attempt -= 1  # это не «неудачная попытка», а смена способа
+                    continue
+                except TransferError as e:
+                    if not e.retriable:
+                        raise
+                    last_error = e
+                    delay = e.retry_after or delay
+                    log.warning("Попытка загрузки %s/%s не удалась: %s", attempt, UPLOAD_RETRIES, e)
+                except httpx.TransportError as e:
+                    last_error = e
+                    log.warning("Попытка загрузки %s/%s не удалась: %s: %s", attempt, UPLOAD_RETRIES, type(e).__name__, e)
+
+                # Попытка не удалась. Обрывок надо убрать ДО повтора: copyparty не перезаписывает файл, а
+                # создаёт рядом копию «имя-<время>-<id>.ext», и размер на сервере так и останется обрезком.
+                if partial_name:
+                    cleaned = await delete_remote_quietly(url, user, pw, partial_name)
+                    if cleaned:
+                        partial_name = None
+                    elif not use_temp:
+                        partial_name = None  # удалить не вышло, повторять бессмысленно
+                        raise last_error  # повтор в то же имя только наплодит копий
+                if attempt < UPLOAD_RETRIES:
+                    await sleep_waiting(state, delay)
+            raise last_error
+        finally:
+            if not committed and partial_name:
+                await delete_remote_quietly(url, user, pw, partial_name)
 
 
 async def refresh_jellyfin() -> Optional[bool]:
@@ -899,14 +1259,7 @@ async def transfer_file(message, kind: str, filename: str, local_path: Path, sta
         await run_blocking(fix_mp3_tags, str(local_path))
 
     url, user, pw = TARGETS[kind]
-    state.begin("upload", 1, current=0, total=local_path.stat().st_size)
-
-    existed = await get_remote_size(url, user, pw, filename) is not None
-    if existed:
-        log.warning("Файл «%s» уже существует на сервере — будет перезаписан", filename)
-
-    await upload_with_retry(url, user, pw, filename, local_path, state)
-    return existed
+    return await upload_with_retry(url, user, pw, filename, local_path, state)
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -928,6 +1281,9 @@ async def handle_dm(event):
     if is_voice or is_round:
         await event.reply("🎙 Голосовые и видеосообщения-«кружки» не загружаю — жду музыку или видеофайлы.")
         return
+    if any(isinstance(a, JUNK_ATTR_TYPES) for a in attrs):
+        await event.reply("🎞 GIF-анимации и стикеры не загружаю — жду музыку или видеофайлы.")
+        return
 
     orig_filename = None
     for attr in attrs:
@@ -941,28 +1297,31 @@ async def handle_dm(event):
     orig_filename = clean_filename(orig_filename)
 
     mime_type = getattr(doc, "mime_type", None)
-    kind = classify(orig_filename, mime_type)
+    has_video_attr = any(isinstance(a, DocumentAttributeVideo) for a in attrs)
+    kind = classify(orig_filename, mime_type, size=doc.size or 0, has_video_attr=has_video_attr)
     if kind is None:
         await event.reply("🤷 Не понимаю, что это за файл — жду музыку (🎵 mp3/flac/…) или видео (🎬 mp4/mkv/…).")
         return
 
-    ext = Path(orig_filename).suffix
-    if not re.fullmatch(r"\.[A-Za-z0-9]{1,5}", ext):
-        # расширения нет или это мусор вроде ".2 final" — берём по mime, иначе файл останется без расширения
-        ext = ext_from_mime(mime_type) or (".mp4" if kind == "movie" else ".mp3")
-        orig_filename = Path(orig_filename).stem + ext
+    # Расширения нет или это обрывок названия («Mr. Brightside») — дописываем по mime, ничего не отрезая.
+    orig_filename, ext = ensure_extension(orig_filename, kind, mime_type)
 
     filename = orig_filename
     if kind == "movie":
         parsed = parse_video_caption(event.raw_text)
-        if parsed:
-            filename = build_filename_from_video_caption(parsed, ext)
-            log.info("Распознал подпись видео: %s -> %s", parsed, filename)
+        candidate = build_filename_from_video_caption(parsed, ext) if parsed else None
     else:
         parsed = parse_music_caption(event.raw_text)
-        if parsed:
-            filename = build_filename_from_music_caption(parsed, ext)
-            log.info("Распознал подпись трека: %s -> %s", parsed, filename)
+        candidate = build_filename_from_music_caption(parsed, ext) if parsed else None
+    if parsed:
+        if should_use_caption(kind, orig_filename, parsed):
+            filename = candidate
+            log.info("Имя по подписи (%s): %s -> %s", CAPTION_NAMING, parsed, filename)
+        else:
+            log.info(
+                "Подпись распознана (%s), но имя файла из Telegram «%s» уже информативно — оставляю его",
+                candidate, orig_filename,
+            )
     filename = truncate_filename(filename)
 
     size = doc.size or 0
@@ -985,7 +1344,8 @@ async def handle_dm(event):
 
         final_text = None
         try:
-            existed = await with_stall_watchdog(transfer_file(event.message, kind, filename, local_path, state), state)
+            # Watchdog на зависания работает внутри transfer_file — на каждой попытке скачивания/отправки.
+            existed = await transfer_file(event.message, kind, filename, local_path, state)
             await stop_updater()
 
             note = "\n⚠️ Файл с таким именем уже был на сервере — заменён." if existed else ""
@@ -1033,6 +1393,9 @@ async def main():
         )
         await client.run_until_disconnected()
     finally:
+        # Закрываем клиента явно: иначе сессия (sqlite) и состояние для catch_up могут сохраниться не до конца.
+        with contextlib.suppress(Exception):
+            await client.disconnect()
         await http.aclose()
 
 
