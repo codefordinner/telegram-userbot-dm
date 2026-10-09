@@ -19,6 +19,11 @@ Userbot: принимает в личку музыку/видео и залив�
   * CATCH_UP           — подтягивать сообщения, пришедшие, пока бот был выключен (1/0, по умолчанию 1)
   * AMBIGUOUS_MIN_MB   — «.ts» считаем видео (а не TypeScript), только если файл не меньше N МБ
                          или у него есть видео-атрибуты Telegram (по умолчанию 5)
+  * BUTTONS_BOT_TOKEN  — токен бота-помощника (@BotFather). Юзербот не умеет слать inline-кнопки, поэтому,
+                         когда тип файла непонятен, кнопки «Музыка / Фильм / Отмена» присылает этот бот
+                         (один раз нажмите в нём /start). Без токена бот спрашивает текстом: ответьте на его
+                         вопрос «1» (музыка), «2» (фильм) или «0» (отмена)
+  * CHOICE_TIMEOUT_SEC — сколько секунд ждать выбора, прежде чем пропустить файл (по умолчанию 300)
 """
 import asyncio
 import contextlib
@@ -41,7 +46,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import httpx
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
 from telethon.tl.types import (
@@ -89,8 +94,10 @@ TARGETS = {
     "movie": (MOVIES_URL, MOVIES_USER, MOVIES_PASS),
 }
 
-AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac"}
+AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".mka"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+# Контейнеры, в которых бывает и звук без картинки (трек, присланный как «.mp4»): для музыки меняем на .m4a.
+MP4_FAMILY_EXTS = {".mp4", ".m4v", ".mov"}
 # «.ts» — это и MPEG-TS, и TypeScript (Telegram даже присылает его как video/mp2t), поэтому
 # видео считаем только при наличии видео-атрибутов или достаточного размера.
 AMBIGUOUS_VIDEO_EXTS = {".ts"}
@@ -150,6 +157,10 @@ if CAPTION_NAMING not in ("auto", "always", "never"):
 # Догонять сообщения, пришедшие, пока бот был выключен.
 CATCH_UP = env_flag("CATCH_UP", True)
 
+# Вопрос «музыка или фильм?», когда тип файла определить не удалось.
+BUTTONS_BOT_TOKEN = os.environ.get("BUTTONS_BOT_TOKEN", "").strip()
+CHOICE_TIMEOUT_SEC = int(os.environ.get("CHOICE_TIMEOUT_SEC", "300"))
+
 # Какие HTTP-статусы считаем успешной загрузкой и какие ошибки имеет смысл повторять.
 OK_UPLOAD_STATUSES = {200, 201, 204}
 RETRY_UPLOAD_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -203,6 +214,11 @@ client.parse_mode = None
 
 # Общий httpx-клиент (создаётся в main()): переиспользует соединения вместо нового на каждый запрос.
 http: Optional[httpx.AsyncClient] = None
+
+# Бот-помощник для inline-кнопок (создаётся в main(), если задан BUTTONS_BOT_TOKEN).
+bot_client: Optional[TelegramClient] = None
+# Ожидающие выбора: ключ ("cb", token) или ("reply", chat_id, id_вопроса) → Future с ответом.
+PENDING_CHOICES: dict = {}
 
 
 # ---------- состояние передачи и ошибки ----------
@@ -297,11 +313,25 @@ def remove_quietly(path: Path) -> None:
         path.unlink()
 
 
-def classify(filename: str, mime_type: Optional[str] = None, size: int = 0, has_video_attr: bool = False):
+def classify(
+    filename: str,
+    mime_type: Optional[str] = None,
+    size: int = 0,
+    has_video_attr: bool = False,
+    has_audio_attr: bool = False,
+):
+    """Музыка или фильм. Расширению доверяем не слепо: трек в контейнере mp4 (Telegram-аудио с именем
+    «Artist - Title.mp4») по расширению выглядит как видео, поэтому сначала смотрим на атрибуты и mime."""
     ext = Path(filename).suffix.lower()
+    mime = (mime_type or "").lower()
     if ext in AUDIO_EXTS:
         return "music"
     if ext in VIDEO_EXTS:
+        if has_video_attr:
+            return "movie"
+        # Нет видео-атрибута, но Telegram считает файл аудио (атрибут Audio или mime audio/*) → это трек.
+        if has_audio_attr or mime.startswith("audio/"):
+            return "music"
         return "movie"
     if ext in AMBIGUOUS_VIDEO_EXTS:
         # По mime тут не отличить (TypeScript тоже «video/mp2t»), поэтому смотрим на атрибуты и размер.
@@ -1262,6 +1292,150 @@ async def transfer_file(message, kind: str, filename: str, local_path: Path, sta
     return await upload_with_retry(url, user, pw, filename, local_path, state)
 
 
+# ---------- вопрос «музыка или фильм?» ----------
+KIND_LABELS = {"music": "🎵 музыку", "movie": "🎬 фильмы"}
+CHOICE_ALIASES = {
+    "1": "music", "м": "music", "музыка": "music", "music": "music",
+    "2": "movie", "ф": "movie", "фильм": "movie", "видео": "movie", "movie": "movie",
+    "0": "cancel", "отмена": "cancel", "нет": "cancel", "cancel": "cancel",
+}
+
+
+def parse_choice(text: str) -> Optional[str]:
+    return CHOICE_ALIASES.get((text or "").strip().lower())
+
+
+def sender_allowed(sender_id) -> bool:
+    return not ALLOWED_SENDER_IDS or sender_id in ALLOWED_SENDER_IDS
+
+
+def resolve_text_choice(event) -> bool:
+    """Текстовый ответ («1»/«2»/«0») на вопрос бота. True — ответ принят."""
+    if not event.is_reply or not event.raw_text:
+        return False
+    fut = PENDING_CHOICES.get(("reply", event.chat_id, event.reply_to_msg_id))
+    choice = parse_choice(event.raw_text)
+    if fut is None or choice is None or fut.done():
+        return False
+    fut.set_result(choice)
+    return True
+
+
+def align_extension(filename: str, ext: str, kind: str, mime_type: Optional[str]) -> tuple:
+    """После ручного выбора: если расширение не подходит выбранному типу, меняем его на mime-овое
+    (только если оно подходит); иначе оставляем как есть — не выдаём неизвестный файл за «.mp3»."""
+    allowed = AUDIO_EXTS if kind == "music" else (VIDEO_EXTS | AMBIGUOUS_VIDEO_EXTS)
+    if ext.lower() in allowed:
+        return filename, ext
+    new_ext = ext_from_mime(mime_type)
+    if new_ext in allowed:
+        return filename[: -len(ext)] + new_ext, new_ext
+    return filename, ext
+
+
+async def ask_kind(event, filename: str) -> Optional[str]:
+    """Спрашивает, куда положить файл. Возвращает 'music' / 'movie' или None (отмена / нет ответа).
+    С ботом-помощником шлёт кнопки; плюс всегда принимает текстовый ответ на сообщение юзербота."""
+    fut = asyncio.get_running_loop().create_future()
+    token = uuid.uuid4().hex[:10]
+    keys = []
+    helper_msg = None
+
+    if bot_client is not None:
+        try:
+            helper_msg = await bot_client.send_message(
+                event.sender_id,
+                f"🤔 Не могу понять, что это за файл: «{filename}»\nКуда его положить?",
+                buttons=[
+                    [
+                        Button.inline("🎵 Музыка", f"kind:{token}:music".encode()),
+                        Button.inline("🎬 Фильм", f"kind:{token}:movie".encode()),
+                    ],
+                    [Button.inline("✖️ Отмена", f"kind:{token}:cancel".encode())],
+                ],
+            )
+            keys.append(("cb", token))
+        except Exception as e:
+            # Чаще всего — вы ещё не нажимали /start у бота-помощника, он не может вам писать.
+            log.warning("Бот-помощник не смог отправить кнопки (нажмите в нём /start): %s", e)
+
+    how = "Нажмите кнопку в чате с ботом-помощником или ответьте" if helper_msg else "Ответьте на это сообщение"
+    prompt = await event.reply(
+        f"🤔 Не понимаю, что это за файл: «{filename}».\n"
+        f"{how}: 1 — музыка, 2 — фильм, 0 — отмена."
+    )
+    keys.append(("reply", event.chat_id, prompt.id))
+    for key in keys:
+        PENDING_CHOICES[key] = fut
+
+    try:
+        choice = await asyncio.wait_for(fut, timeout=CHOICE_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        choice = None
+    finally:
+        for key in keys:
+            PENDING_CHOICES.pop(key, None)
+
+    result = choice if choice in KIND_LABELS else None
+    if result:
+        note = f"✅ Понял, кладу в {KIND_LABELS[result]}."
+    elif choice is None:
+        note = "⌛ Ответа не дождался — файл пропущен."
+    else:
+        note = "✖️ Отменено."
+    await safe_edit(prompt, note)
+    if helper_msg is not None:
+        with contextlib.suppress(Exception):
+            await helper_msg.edit(note)  # заодно убирает кнопки
+    return result
+
+
+async def on_kind_button(event):
+    """Нажатие кнопки у бота-помощника."""
+    if not sender_allowed(event.sender_id):
+        await event.answer("Нет доступа", alert=True)
+        return
+    try:
+        _, token, choice = event.data.decode().split(":", 2)
+    except ValueError:
+        return
+    fut = PENDING_CHOICES.get(("cb", token))
+    if fut is None or fut.done():
+        await event.answer("Этот вопрос уже неактуален")
+        return
+    fut.set_result(choice)
+    await event.answer("Принято")
+
+
+async def on_helper_start(event):
+    if event.is_private and sender_allowed(event.sender_id):
+        await event.reply("Готово ✅ Когда юзербот не поймёт тип файла, кнопки придут сюда.")
+
+
+async def start_buttons_bot() -> None:
+    """Запускает бота-помощника, если задан токен. Сбой не мешает основной работе — останется текстовый вопрос."""
+    global bot_client
+    if not BUTTONS_BOT_TOKEN:
+        return
+    candidate = TelegramClient(
+        SESSION_PATH + "_buttons", API_ID, API_HASH,
+        connection_retries=-1, retry_delay=2, auto_reconnect=True,
+    )
+    candidate.parse_mode = None
+    candidate.add_event_handler(on_kind_button, events.CallbackQuery(pattern=rb"^kind:"))
+    candidate.add_event_handler(on_helper_start, events.NewMessage(pattern=r"^/start", incoming=True))
+    try:
+        await candidate.start(bot_token=BUTTONS_BOT_TOKEN)
+        me = await candidate.get_me()
+    except Exception as e:
+        log.warning("Бот-помощник не запустился, вопросы будут текстовыми: %s", e)
+        with contextlib.suppress(Exception):
+            await candidate.disconnect()
+        return
+    bot_client = candidate
+    log.info("Бот-помощник для кнопок запущен: @%s", me.username)
+
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_dm(event):
     if not event.is_private:
@@ -1273,6 +1447,7 @@ async def handle_dm(event):
 
     doc = event.document
     if not event.media or not doc:
+        resolve_text_choice(event)  # может быть ответом «1/2/0» на вопрос бота
         return
 
     attrs = doc.attributes or []
@@ -1298,13 +1473,29 @@ async def handle_dm(event):
 
     mime_type = getattr(doc, "mime_type", None)
     has_video_attr = any(isinstance(a, DocumentAttributeVideo) for a in attrs)
-    kind = classify(orig_filename, mime_type, size=doc.size or 0, has_video_attr=has_video_attr)
+    has_audio_attr = any(isinstance(a, DocumentAttributeAudio) for a in attrs)
+    kind = classify(
+        orig_filename, mime_type, size=doc.size or 0,
+        has_video_attr=has_video_attr, has_audio_attr=has_audio_attr,
+    )
+    asked = False
     if kind is None:
-        await event.reply("🤷 Не понимаю, что это за файл — жду музыку (🎵 mp3/flac/…) или видео (🎬 mp4/mkv/…).")
-        return
+        # Вопрос идёт ДО очереди загрузок, так что ожидание ответа не занимает слот.
+        asked = True
+        kind = await ask_kind(event, orig_filename)
+        if kind is None:
+            return
 
     # Расширения нет или это обрывок названия («Mr. Brightside») — дописываем по mime, ничего не отрезая.
     orig_filename, ext = ensure_extension(orig_filename, kind, mime_type)
+    if asked:
+        orig_filename, ext = align_extension(orig_filename, ext, kind, mime_type)
+
+    # Трек, пришедший как «.mp4»/«.m4v»/«.mov»: в музыкальной библиотеке и для индексатора тегов нужен «.m4a».
+    if kind == "music" and ext.lower() in MP4_FAMILY_EXTS:
+        orig_filename = orig_filename[: -len(ext)] + ".m4a"
+        ext = ".m4a"
+        log.info("Аудио в контейнере mp4 — переименовал в %s", orig_filename)
 
     filename = orig_filename
     if kind == "movie":
@@ -1385,6 +1576,7 @@ async def main():
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=4),
     )
     try:
+        await start_buttons_bot()
         await client.start()
         me = await client.get_me()
         log.info(
@@ -1396,6 +1588,9 @@ async def main():
         # Закрываем клиента явно: иначе сессия (sqlite) и состояние для catch_up могут сохраниться не до конца.
         with contextlib.suppress(Exception):
             await client.disconnect()
+        if bot_client is not None:
+            with contextlib.suppress(Exception):
+                await bot_client.disconnect()
         await http.aclose()
 
 
