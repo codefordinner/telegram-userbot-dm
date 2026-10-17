@@ -3041,9 +3041,34 @@ def is_link_message(event) -> bool:
     return any(not _SKIP_URL_RE.search(u) for u in extract_urls(text))
 
 
-def link_kind(url: str) -> Optional[str]:
+LINK_DEFAULT_KIND = os.environ.get("LINK_DEFAULT_KIND", "").strip().lower()  # music | movie | пусто = по обстановке
+
+
+def looks_like_song(info: dict) -> bool:
+    """Песня ли это по метаданным yt-dlp: категория Music, поля artist/track/album или канал «… - Topic»
+    (так выглядят ссылки youtu.be/… из приложения YouTube Music)."""
+    cats = info.get("categories") or []
+    who = f"{info.get('channel') or ''} {info.get('uploader') or ''}"
+    return bool(
+        info.get("track") or info.get("artist") or info.get("artists") or info.get("album")
+        or "Music" in cats or re.search(r"-\s*Topic\b", who)
+    )
+
+
+def link_kind(url: str, items: Optional[list] = None, text: str = "") -> Optional[str]:
+    """Аудио или видео. Порядок: флаги в сообщении (--video / --audio) → адрес music.youtube.com,
+    SoundCloud, Bandcamp → LINK_DEFAULT_KIND → «похоже на песню» по метаданным. None — спросить."""
+    low = text.lower()
+    if "--video" in low:
+        return "movie"
+    if "--audio" in low or "--music" in low:
+        return "music"
     host = (urlparse(url).hostname or "").lower()
     if any(host == h or host.endswith("." + h) for h in _MUSIC_HOSTS):
+        return "music"
+    if LINK_DEFAULT_KIND in ("music", "movie"):
+        return LINK_DEFAULT_KIND
+    if items and looks_like_song(items[0]):
         return "music"
     return None
 
@@ -3310,7 +3335,7 @@ async def ingest_link(event, url: str, force: bool) -> None:
         with contextlib.suppress(Exception):
             await status.delete()
 
-    kind = link_kind(url)
+    kind = link_kind(url, items, event.raw_text or "")
     cut = f" (беру первые {len(items)})" if total_found > len(items) else ""
     if kind is None:
         first = short_name(items[0].get("title") or url, 70)
@@ -3326,7 +3351,7 @@ async def ingest_link(event, url: str, force: bool) -> None:
         kind = choice
     elif len(items) > 1:
         choice = await ask_choice(
-            event, f"📋 «{short_name(title or url, 60)}» — {len(items)} шт.{cut}. Скачать все как музыку?",
+            event, f"📋 «{short_name(title or url, 60)}» — {len(items)} шт.{cut}. Скачать все как {'музыку' if kind == 'music' else 'видео'}?",
             [[("⬇️ Скачать все", "yes"), ("✖️ Отмена", "cancel")]],
             YES_ALIASES, "да — скачать, нет — отмена", _dup_note,
         )
