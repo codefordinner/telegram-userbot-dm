@@ -5,7 +5,9 @@ Userbot: принимает в личку музыку/видео и залив�
   TG_API_ID, TG_API_HASH, SESSION_PATH, ALLOWED_SENDER_IDS
   MUSIC_COPYPARTY_URL/USER/PASS, MOVIES_COPYPARTY_URL/USER/PASS
   JELLYFIN_URL, JELLYFIN_API_KEY
-  * TMP_DIR            — куда качать временные файлы (по умолчанию /tmp/userbot-uploader)
+  * TMP_DIR            — куда качать временные файлы (по умолчанию /tmp/userbot-uploader).
+                         Чтобы докачка переживала не только перезапуск, но и пересоздание контейнера
+                         (docker compose up -d после обновления образа), примонтируйте сюда volume
   * CHECK_DISK         — проверять свободное место перед скачиванием (1/0, по умолчанию 1)
   * MIN_FREE_DISK_GB   — сколько ГБ должно остаться свободным после записи (по умолчанию 1.5)
   * STALL_TIMEOUT_SEC  — сколько секунд без прогресса считать зависанием (по умолчанию 180, 0 = выкл.);
@@ -23,7 +25,7 @@ Userbot: принимает в личку музыку/видео и залив�
                          когда тип файла непонятен, кнопки «Музыка / Фильм / Отмена» присылает этот бот
                          (один раз нажмите в нём /start). Без токена бот спрашивает текстом: ответьте на его
                          вопрос «1» (музыка), «2» (фильм) или «0» (отмена)
-  * CHOICE_TIMEOUT_SEC — сколько секунд ждать выбора, прежде чем пропустить файл (по умолчанию 300)
+  * CHOICE_TIMEOUT_SEC — сколько секунд ждать выбора/ответа, прежде чем пропустить файл (по умолчанию 300)
   * LIBRARY_ADMIN      — команды управления музыкальной библиотекой в личке: /find /last /info /rename /set
                          /del /stats /rescan (1/0, по умолчанию 1). Нужен beets В ТОЙ ЖЕ ВЕРСИИ, что и в контейнере
                          импорта, и общие папки библиотеки и конфига по тем же путям, что и там
@@ -37,6 +39,19 @@ Userbot: принимает в личку музыку/видео и залив�
   * BEETS_TIMEOUT_SEC  — сколько секунд ждать одну команду beets (по умолчанию 120)
   * NAVIDROME_URL/USER/PASS — после правок библиотеки запускать пересканирование Navidrome
                          (по умолчанию http://navidrome:4533; без логина и пароля пересканирование отключено)
+
+  Новое в этой версии:
+  * DOWNLOAD_WORKERS   — сколько кусков файла качать из Telegram параллельно (по умолчанию 4; 1 = по одному)
+  * DOWNLOAD_REQUEST_KB — размер одного запроса к Telegram, КБ (по умолчанию 1024; допустимо 512, 1024)
+  * RESUME_ON_START    — после перезапуска бота продолжать недокачанные/неотправленные файлы (1/0, по умолчанию 1)
+  * RESUME_MAX_AGE_HOURS — задания старше этого срока после перезапуска не возобновляются (по умолчанию 24)
+  * BATCH_GRACE_SEC    — сколько секунд после последнего файла ждать новых, прежде чем закрыть общий статус
+                         пачки/альбома и запустить один скан Jellyfin (по умолчанию 4)
+
+Сериалы (видео с «S01E02» / «1x02» в имени или «N сезон M серия» в подписи) раскладываются по папкам:
+  <Название сериала>/Season 01/<файл>. Год в названии папки не используется; если папка сериала уже есть
+  (с другим регистром, знаками или годом — «Dune (2021)»), серия кладётся в неё. Если не удаётся понять,
+  что за файл, бот спрашивает в чате.
 """
 import asyncio
 import contextlib
@@ -44,6 +59,7 @@ import errno
 import functools
 import hashlib
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -55,10 +71,10 @@ import unicodedata
 import uuid
 import weakref
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 from telethon import Button, TelegramClient, events
@@ -143,10 +159,24 @@ PROGRESS_EDIT_INTERVAL_SEC = 4
 SPEED_WINDOW_SEC = 15  # скорость и ETA считаем по скользящему окну, а не по среднему с начала
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 
-# Размер запроса к Telegram: кратен 4 КБ, 1 МБ делится на него нацело (требование API).
-DOWNLOAD_REQUEST_SIZE = 512 * 1024
-# Докачку начинаем с границы, кратной 1 МБ — иначе Telegram отклонит offset.
-RESUME_ALIGN = 1024 * 1024
+
+def _pick_request_size() -> int:
+    """Размер одного запроса upload.getFile. Telegram требует: кратно 4 КБ и нацело делит 1 МБ
+    (запрос не должен пересекать границу мегабайта). Всё остальное заменяем безопасными 512 КБ."""
+    try:
+        size = int(float(os.environ.get("DOWNLOAD_REQUEST_KB", "1024")) * 1024)
+    except ValueError:
+        return 512 * 1024
+    if size <= 0 or size % 4096 or (1024 * 1024) % size:
+        return 512 * 1024
+    return size
+
+
+DOWNLOAD_REQUEST_SIZE = _pick_request_size()
+# Файл режется на сегменты; воркеры берут сегменты по очереди и качают их параллельно (несколько запросов
+# «в полёте» разом — именно это и ускоряет закачку: один поток упирается в задержку каждого запроса).
+DOWNLOAD_WORKERS = max(1, int(os.environ.get("DOWNLOAD_WORKERS", "4")))
+DOWNLOAD_SEGMENT = 4 * 1024 * 1024  # кратно DOWNLOAD_REQUEST_SIZE (а значит и 1 МБ)
 
 # Не больше N файлов одновременно скачиваем/грузим — бережём диск и канал.
 MAX_CONCURRENT_TRANSFERS = 2
@@ -163,6 +193,8 @@ PERMS_TTL_SEC = 3600  # как долго помнить права пользо
 OK_MOVE_STATUSES = {200, 201, 204}
 # copyparty на отсутствие права move/delete отвечает 401 (не 403!); 405/501 — метод не поддерживается.
 MOVE_DENIED_STATUSES = {401, 403, 405, 501}
+# MKCOL: 201 — создано, 405 — папка уже есть (оба случая нас устраивают).
+OK_MKCOL_STATUSES = {200, 201, 204, 405}
 
 # Откуда брать имя файла: подпись к сообщению или имя из Telegram (см. should_use_caption).
 CAPTION_NAMING = os.environ.get("CAPTION_NAMING", "auto").strip().lower()
@@ -182,7 +214,7 @@ MUSIC_VIDEO_UNKNOWN_DURATION_MAX_BYTES = 150 * 1024 * 1024  # если Telegram 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", "600"))
-BOT_VERSION = "2026-10-09-library-clips"  # пишется в лог при старте: по нему видно, какая версия реально запущена
+BOT_VERSION = "2026-10-16-series-batches-resume"  # пишется в лог при старте: по нему видно, какая версия реально запущена
 
 # Управление библиотекой через beets (команды /find /rename /del …).
 LIBRARY_ADMIN = env_flag("LIBRARY_ADMIN", True)
@@ -220,9 +252,21 @@ UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0)
 
 # Имя файла на сервере (ограничение ФС — 255 байт, оставляем запас).
 MAX_FILENAME_BYTES = 200
+MAX_DIRNAME_BYTES = 120
 
-# Временные файлы. Папка выделенная: при старте из неё удаляется всё, что осталось от прошлого запуска.
+# Временные файлы. Папка выделенная: при старте из неё удаляется всё, что не относится к заданиям,
+# которые можно продолжить (см. prepare_tmp_dir).
 TMP_DIR = Path(os.environ.get("TMP_DIR", "/tmp/userbot-uploader"))
+# Журнал заданий: пока файл не залит, о нём остаётся запись, и после перезапуска бот продолжает с места обрыва.
+JOURNAL_DIR = TMP_DIR / "jobs"
+RESUME_ON_START = env_flag("RESUME_ON_START", True)
+RESUME_MAX_AGE_SEC = int(float(os.environ.get("RESUME_MAX_AGE_HOURS", "24")) * 3600)
+RESUME_MAX_STARTS = 3  # задание, на котором бот падает раз за разом, через N запусков выбрасываем
+
+# Пачки и альбомы: файлы, пришедшие друг за другом, делят одно статусное сообщение и один скан Jellyfin.
+BATCH_GRACE_SEC = float(os.environ.get("BATCH_GRACE_SEC", "4"))
+MAX_BATCH_LINES = 20
+MAX_MESSAGE_CHARS = 3900  # лимит Telegram — 4096
 
 # Проверка места на диске: после записи файла должно остаться не меньше MIN_FREE_DISK_AFTER_BYTES.
 CHECK_DISK = env_flag("CHECK_DISK", True)
@@ -252,8 +296,22 @@ http: Optional[httpx.AsyncClient] = None
 
 # Бот-помощник для inline-кнопок (создаётся в main(), если задан BUTTONS_BOT_TOKEN).
 bot_client: Optional[TelegramClient] = None
-# Ожидающие выбора: ключ ("cb", token) или ("reply", chat_id, id_вопроса) → (Future с ответом, текстовые синонимы).
+# Ожидающие выбора: ключ ("cb", token) или ("reply", chat_id, id_вопроса) → (Future с ответом, текстовые синонимы
+# или None, если ждём произвольный текст).
 PENDING_CHOICES: dict = {}
+
+# Сообщения, которые уже в работе (или будут возобновлены после перезапуска): защита от повторной обработки,
+# например когда catch_up заново присылает сообщение, из-за которого бот упал.
+ACTIVE_JOBS: set = set()
+# Фоновые задачи держим по ссылке: asyncio хранит на них только слабые ссылки.
+BACKGROUND_TASKS: set = set()
+
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
 
 
 # ---------- состояние передачи и ошибки ----------
@@ -302,6 +360,35 @@ class RenameUnsupported(TransferError):
 
 
 ACTIVE_TRANSFERS = set()
+
+
+@dataclass
+class Job:
+    """Одно принятое к загрузке сообщение. Всё, что нужно, чтобы довести его до конца после перезапуска
+    (вопросы пользователю уже заданы, имя и раскладка определены)."""
+    chat_id: int
+    sender_id: int
+    message_id: int
+    kind: str  # "music" | "movie"
+    filename: str  # имя файла на сервере (без папок)
+    size: int = 0
+    extract: bool = False  # достать звук из клипа
+    series: Optional[dict] = None  # {"show": «Название», "season": 1} — серия сериала
+    starts: int = 0  # сколько раз задание возобновляли после перезапуска
+
+    @property
+    def key(self) -> tuple:
+        return (self.chat_id, self.message_id)
+
+    @property
+    def local_path(self) -> Path:
+        # Имя временного файла не зависит от названия (длинные/странные имена не ломают ФС),
+        # а пара sender_id + message.id уникальна между разными отправителями.
+        return TMP_DIR / f"{self.sender_id}_{self.message_id}.part"
+
+    @property
+    def journal_path(self) -> Path:
+        return JOURNAL_DIR / f"{self.sender_id}_{self.message_id}.json"
 
 
 def describe_status(code: int) -> str:
@@ -437,6 +524,14 @@ def truncate_filename(name: str, max_bytes: int = MAX_FILENAME_BYTES) -> str:
     return (stem or "file") + ext
 
 
+def truncate_dirname(name: str, max_bytes: int = MAX_DIRNAME_BYTES) -> str:
+    """Укорачивает имя папки (у неё нет расширения, которое надо беречь)."""
+    if len(name.encode("utf-8")) <= max_bytes:
+        return name
+    cut = name.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore").rstrip(" .")
+    return cut or "folder"
+
+
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґЎў]")
 _CYRILLIC_VOWEL_RE = re.compile(r"[аеёиоуыэюяіїє]", re.IGNORECASE)
 
@@ -510,16 +605,79 @@ def guess_filename(message, doc) -> str:
     return base + ext_from_mime(getattr(doc, "mime_type", None))
 
 
-# ---------- диск ----------
-def prepare_tmp_dir() -> None:
+# ---------- диск и журнал заданий ----------
+def meta_path(local_path: Path) -> Path:
+    """Рядом с недокачанным файлом лежит «паспорт»: сколько байт с начала файла точно скачано."""
+    return local_path.with_name(local_path.name + ".meta")
+
+
+def drop_job_files(job: Job) -> None:
+    """Убирает всё, что осталось на диске от задания (временные файлы и запись в журнале)."""
+    remove_quietly(job.local_path)
+    remove_quietly(meta_path(job.local_path))
+    remove_quietly(job.local_path.with_suffix(".m4a"))
+    remove_quietly(job.journal_path)
+
+
+def journal_write(job: Job) -> None:
+    try:
+        JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = job.journal_path.with_name(job.journal_path.name + ".tmp")
+        tmp.write_text(json.dumps(asdict(job), ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, job.journal_path)
+    except OSError as e:
+        log.warning("Не удалось записать задание в журнал (после перезапуска докачки не будет): %s", e)
+
+
+def load_journal() -> list:
+    """Задания, которые можно продолжить. Битые, старые и «падающие» записи выбрасываем."""
+    jobs = []
+    now = time.time()
+    for p in sorted(JOURNAL_DIR.glob("*.json")):
+        try:
+            job = Job(**json.loads(p.read_text(encoding="utf-8")))
+            fresh = now - p.stat().st_mtime < RESUME_MAX_AGE_SEC
+        except (OSError, ValueError, TypeError):
+            remove_quietly(p)
+            continue
+        if not fresh or job.starts >= RESUME_MAX_STARTS:
+            log.info("Задание «%s» не возобновляю (старое или слишком часто падало) — удаляю", job.filename)
+            drop_job_files(job)
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def prepare_tmp_dir() -> list:
+    """Чистит временную папку и возвращает задания, которые надо продолжить после перезапуска.
+    Недокачанные файлы остаются только если у них есть запись в журнале; всё остальное — мусор."""
     TMP_DIR.mkdir(parents=True, exist_ok=True)
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    if RESUME_ON_START:
+        jobs = load_journal()
+    else:
+        jobs = []
+        for p in JOURNAL_DIR.glob("*"):
+            remove_quietly(p)
+
+    for p in JOURNAL_DIR.glob("*.tmp"):  # недописанные записи журнала от аварийной остановки
+        remove_quietly(p)
+
+    keep = set()
+    for job in jobs:
+        keep.add(job.local_path.name)
+        keep.add(meta_path(job.local_path).name)
+
     removed = 0
     for p in TMP_DIR.iterdir():
-        if p.is_file():
+        if p.is_file() and p.name not in keep:
             remove_quietly(p)
             removed += 1
     if removed:
-        log.info("Удалено %d недокачанных временных файлов из %s", removed, TMP_DIR)
+        log.info("Удалено %d ненужных временных файлов из %s", removed, TMP_DIR)
+    for job in jobs:
+        log.info("К продолжению после перезапуска: «%s» (сообщение %s)", job.filename, job.message_id)
+    return jobs
 
 
 def ensure_disk_space(needed_bytes: int, state: TransferState) -> None:
@@ -577,6 +735,14 @@ def make_progress_bar(pct: int, width: int = 20) -> str:
     pct = max(0, min(100, pct))
     filled = int(width * pct / 100)
     return "█" * filled + "░" * (width - filled)
+
+
+def fit_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
+    return text if len(text) <= limit else text[: limit - 20].rstrip() + "\n…(обрезано)"
+
+
+def short_name(name: str, limit: int = 60) -> str:
+    return name if len(name) <= limit else name[: limit - 1] + "…"
 
 
 async def safe_edit(message, text: str) -> bool:
@@ -758,6 +924,99 @@ def should_use_caption(kind: str, orig_filename: str, parsed: dict) -> bool:
     return not (_YEAR_RE.search(stem) and len(_LETTER_RE.findall(stem)) >= 3)
 
 
+# ---------- сериалы: распознавание и имена папок ----------
+# «Show.S01E02», «Show - S01E02 - Title», «Show 1x02». Номер сезона обязателен: «E05» без сезона сериалом не считаем.
+_SERIES_MARK_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:S(\d{1,2})[ ._-]?E(\d{1,3})|(\d{1,2})x(\d{2,3}))(?![0-9])", re.IGNORECASE
+)
+_PAREN_YEAR_RE = re.compile(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]")
+_TRAILING_YEAR_RE = re.compile(r"[\s._-]+(?:19|20)\d{2}\s*$")
+
+
+def clean_show_name(raw: str) -> str:
+    """Название сериала из «Show.Name.2021.» / «Show Name (2021) - » → «Show Name». Год в имени папки не нужен."""
+    s = normalize_text(raw or "").strip()
+    if " " not in s:
+        s = re.sub(r"[._]+", " ", s)  # «Show.Name.» — точки вместо пробелов
+    else:
+        s = s.replace("_", " ")
+    s = _PAREN_YEAR_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-–—_")
+    s = _TRAILING_YEAR_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-–—_")
+    return sanitize_name(s)
+
+
+def parse_episode_from_name(stem: str):
+    """Сезон/серия/название сериала из имени файла или введённого вручную текста. None — это не серия."""
+    m = _SERIES_MARK_RE.search(stem)
+    if not m:
+        return None
+    return {
+        "show": clean_show_name(stem[: m.start()]),
+        "season": int(m.group(1) or m.group(3)),
+        "episode": int(m.group(2) or m.group(4)),
+    }
+
+
+def detect_series(orig_filename: str, parsed: Optional[dict]):
+    """Серия сериала или нет. Возвращает dict {show, season, episode, episode_title, quality, name_ok} или None.
+    name_ok=True — имя файла уже хорошее и годится как есть; иначе имя надо собрать (build_series_filename).
+    show может быть пустым — тогда вызывающий спросит пользователя."""
+    stem = Path(orig_filename).stem
+    from_name = parse_episode_from_name(stem)
+    cap = None
+    if (
+        parsed and CAPTION_NAMING != "never"
+        and parsed.get("season") is not None and parsed.get("episode") is not None
+    ):
+        cap = parsed
+
+    if cap and (from_name is None or should_use_caption("movie", orig_filename, cap)):
+        return {
+            "show": clean_show_name(cap["title"]), "season": cap["season"], "episode": cap["episode"],
+            "episode_title": cap.get("episode_title"), "quality": cap.get("quality"), "name_ok": False,
+        }
+    if from_name:
+        show = from_name["show"]
+        name_ok = True
+        if (not show or is_generic_name(show)) and parsed and parsed.get("title") and CAPTION_NAMING != "never":
+            show = clean_show_name(parsed["title"])  # в имени файла названия нет, а в подписи есть
+            name_ok = False
+        return {
+            "show": show, "season": from_name["season"], "episode": from_name["episode"],
+            "episode_title": None, "quality": None, "name_ok": name_ok,
+        }
+    return None
+
+
+def build_series_filename(info: dict, ext: str) -> str:
+    """«Show - S01E02 - Название серии [1080p].mkv» — без года (имя папки сериала тоже без него)."""
+    base = f"{info['show']} - S{info['season']:02d}E{info['episode']:02d}"
+    if info.get("episode_title"):
+        base += f" - {info['episode_title']}"
+    if info.get("quality"):
+        base += f" [{info['quality']}]"
+    return f"{base}{ext}"
+
+
+def series_key(name: str) -> str:
+    """Ключ для сопоставления папок сериала: без регистра, знаков препинания и года в скобках.
+    «Dune: Prophecy», «dune prophecy» и «Dune Prophecy (2024)» дают один и тот же ключ."""
+    s = unicodedata.normalize("NFKC", name).casefold().replace("ё", "е")
+    s = _PAREN_YEAR_RE.sub(" ", s)
+    return re.sub(r"[\W_]+", "", s)
+
+
+_SEASON_DIR_RE = re.compile(r"(?:season|сезон|s)\s*0*(\d+)", re.IGNORECASE)
+
+
+def season_number(dirname: str) -> Optional[int]:
+    """«Season 01», «Season 1», «Сезон 2», «S03» → номер сезона."""
+    m = _SEASON_DIR_RE.fullmatch(dirname.strip())
+    return int(m.group(1)) if m else None
+
+
 # ---------- ID3-теги mp3 ----------
 def _has_id3v1(path: str) -> bool:
     try:
@@ -838,68 +1097,241 @@ def fix_mp3_tags(path: str) -> None:
         log.warning("Не удалось сохранить очищенные ID3-теги: %s: %s", path, e)
 
 
-# ---------- прогресс ----------
-async def progress_updater(status, state: TransferState, stop_event: asyncio.Event):
-    last_shown = None
-    samples = deque()  # (время, байт) — для скорости по скользящему окну
-    sample_key = None
+# ---------- прогресс и общий статус пачки ----------
+class SpeedMeter:
+    """Скорость и ETA по скользящему окну (а не по среднему с начала)."""
 
-    while True:
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=PROGRESS_EDIT_INTERVAL_SEC)
-        except asyncio.TimeoutError:
-            pass
-        if stop_event.is_set():
-            break
+    def __init__(self):
+        self.samples = deque()  # (время, байт)
+        self.key = None
 
-        now = time.monotonic()
-        total = max(state.total, 1)
+    def measure(self, state: TransferState, now: float) -> tuple:
         current = state.current
-        phase = state.phase
-
+        total = max(state.total, 1)
         # Новая фаза/попытка → окно считаем заново (иначе после ретрая скорость «врёт»)
-        key = (phase, state.attempt, state.phase_started_at)
-        if key != sample_key:
-            sample_key = key
-            samples.clear()
-            samples.append((state.phase_started_at, state.phase_start_current))
-        samples.append((now, current))
-        while len(samples) > 2 and samples[1][0] <= now - SPEED_WINDOW_SEC:
-            samples.popleft()
+        key = (state.phase, state.attempt, state.phase_started_at)
+        if key != self.key:
+            self.key = key
+            self.samples.clear()
+            self.samples.append((state.phase_started_at, state.phase_start_current))
+        self.samples.append((now, current))
+        while len(self.samples) > 2 and self.samples[1][0] <= now - SPEED_WINDOW_SEC:
+            self.samples.popleft()
 
-        t0, c0 = samples[0]
+        t0, c0 = self.samples[0]
         dt = now - t0
         speed = max((current - c0) / dt, 0.0) if dt > 0.5 else 0.0
         eta = (max(total - current, 0) / speed) if speed > 0 else float("inf")
+        return speed, eta
 
-        pct = min(100, int(current / total * 100))
-        icon = "📥" if phase == "download" else "📤"
-        label = "Скачиваю" if phase == "download" else "Загружаю на сервер"
-        if phase == "convert":
-            shown = f"🎧 Достаю звук из видео «{state.filename}»…"
-            if shown != last_shown:
+
+@dataclass(eq=False)
+class BatchItem:
+    job: Job
+    state: TransferState
+    status: str = "queued"  # queued → running → ok / error
+    replaced: bool = False
+    where: str = ""  # папка на сервере (для сериалов)
+    error: str = ""
+    final_text: str = ""  # итоговый текст, когда пачка из одного файла
+    meter: SpeedMeter = field(default_factory=SpeedMeter)
+
+    def mark_ok(self, existed: bool, where: str) -> None:
+        self.status = "ok"
+        self.replaced = existed
+        self.where = where
+        note = "\n⚠️ Файл с таким именем уже был на сервере — заменён." if existed else ""
+        name = self.job.filename
+        if self.job.kind == "music":
+            self.final_text = (
+                f"✅ Готово: «{name}»\n"
+                f"📁 Загружено в музыку — теги проставятся автоматически в течение ~10 минут.{note}"
+            )
+        else:
+            place = f": {where}" if where else ""
+            self.final_text = f"✅ Готово: «{name}»\n📁 Загружено в фильмы{place}.{note}"
+
+    def mark_error(self, reason: str) -> None:
+        self.status = "error"
+        self.error = reason
+        self.final_text = f"❌ Не удалось загрузить «{self.job.filename}»: {reason}."
+
+
+# Открытые пачки по чатам. Файлы, пришедшие, пока в чате есть незавершённая пачка (и ещё BATCH_GRACE_SEC после
+# неё), попадают в неё же: у альбома из 10 треков получается одно сообщение и один скан Jellyfin, а не десять.
+BATCHES: dict = {}
+
+
+class Batch:
+    def __init__(self, chat_id: int, send):
+        self.chat_id = chat_id
+        self.send = send  # async (текст) -> сообщение; у возобновлённых заданий нет исходного события
+        self.items: list = []
+        self.status = None
+        self.pending = 0
+        self.closed = False
+        self.lock = asyncio.Lock()
+        self.stop = asyncio.Event()
+        self.updater_task = None
+        self.close_task = None
+
+    # --- жизненный цикл ---
+    def add(self, item: BatchItem) -> None:
+        self.items.append(item)
+        self.pending += 1
+        if self.close_task is not None and not self.close_task.done():
+            self.close_task.cancel()  # пришёл ещё файл — закрытие откладывается
+        self.close_task = None
+
+    def item_finished(self) -> None:
+        self.pending -= 1
+        if self.pending <= 0 and not self.closed and self.close_task is None:
+            self.close_task = spawn(self._close_later())
+
+    async def ensure_status(self) -> None:
+        async with self.lock:
+            if self.status is None:
+                self.status = await self.send(fit_text(self.render()))
+                self.updater_task = spawn(self._run_updater())
+
+    async def _run_updater(self) -> None:
+        last = None
+        while True:
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=PROGRESS_EDIT_INTERVAL_SEC)
+            except asyncio.TimeoutError:
+                pass
+            if self.stop.is_set():
+                break
+            text = fit_text(self.render())
+            if text != last:
                 try:
-                    await status.edit(shown)
-                    last_shown = shown
+                    await self.status.edit(text)
+                    last = text
                 except Exception as e:
                     log.debug("Не удалось обновить прогресс: %s", e)
-            continue
-        retries = UPLOAD_RETRIES if phase == "upload" else DOWNLOAD_RETRIES
-        attempt_note = f" (попытка {state.attempt}/{retries})" if state.attempt > 1 else ""
-        pause_note = "\n⏸ Жду перед повторной попыткой…" if state.waiting else ""
 
-        shown = (
-            f"{icon} {label} «{state.filename}»{attempt_note}\n"
+    async def _close_later(self) -> None:
+        try:
+            await asyncio.sleep(BATCH_GRACE_SEC)
+        except asyncio.CancelledError:
+            return
+        if self.pending > 0 or self.closed:
+            return
+        self.closed = True  # дальше новые файлы пойдут уже в новую пачку
+        if BATCHES.get(self.chat_id) is self:
+            del BATCHES[self.chat_id]
+        try:
+            await self.finish()
+        except Exception:
+            log.exception("Не удалось завершить пачку")
+
+    async def finish(self) -> None:
+        self.stop.set()
+        if self.updater_task is not None:
+            with contextlib.suppress(Exception):
+                await self.updater_task  # чтобы он не затёр итог старым прогрессом
+        if self.status is None:
+            return
+        suffix = ""
+        if any(i.status == "ok" and i.job.kind == "movie" for i in self.items):
+            scan = await refresh_jellyfin()  # один скан на всю пачку
+            if scan is True:
+                suffix = "\n🔄 Сканирование Jellyfin запущено."
+            elif scan is False:
+                suffix = "\n⚠️ Jellyfin не ответил — запустите сканирование библиотеки вручную."
+        await safe_edit(self.status, fit_text(self.render(final_suffix=suffix)))
+
+    # --- отрисовка ---
+    def render(self, final_suffix: str = "") -> str:
+        now = time.monotonic()
+        items = list(self.items)
+        if len(items) == 1:
+            item = items[0]
+            return self._render_single(item, now) + (final_suffix if item.status == "ok" else "")
+
+        total = len(items)
+        ok = sum(1 for i in items if i.status == "ok")
+        bad = sum(1 for i in items if i.status == "error")
+        all_done = ok + bad == total
+        head = f"📦 Готово: {ok} из {total}" if all_done else f"📦 Загружаю файлы: {total} · готово {ok}"
+        if bad:
+            head += f" · ошибок {bad}"
+
+        if total > MAX_BATCH_LINES:
+            lines = [f"✅ Загружено: {ok}"] + [self._line(i, now) for i in items if i.status != "ok"][:MAX_BATCH_LINES]
+        else:
+            lines = [self._line(i, now) for i in items]
+        text = head + "\n" + "\n".join(lines)
+
+        if all_done:
+            notes = []
+            if any(i.status == "ok" and i.job.kind == "music" for i in items):
+                notes.append("📁 Музыка: теги проставятся автоматически в течение ~10 минут.")
+            if any(i.status == "ok" and i.job.kind == "movie" for i in items):
+                notes.append("📁 Видео загружено в фильмы.")
+            if notes:
+                text += "\n\n" + "\n".join(notes)
+            text += final_suffix
+        return text
+
+    def _render_single(self, item: BatchItem, now: float) -> str:
+        job, st = item.job, item.state
+        if item.status == "queued":
+            return f"⏳ Принял «{job.filename}» ({job.size / 1024 / 1024:.0f} МБ), жду очереди…"
+        if item.status in ("ok", "error"):
+            return item.final_text
+        if st.phase == "convert":
+            return f"🎧 Достаю звук из видео «{job.filename}»…"
+        if st.phase == "upload" and st.current >= st.total:
+            return f"📤 «{job.filename}» отправлен — жду подтверждения сервера и проверяю размер…"
+        speed, eta = item.meter.measure(st, now)
+        total = max(st.total, 1)
+        pct = min(100, int(st.current / total * 100))
+        icon = "📥" if st.phase == "download" else "📤"
+        label = "Скачиваю" if st.phase == "download" else "Загружаю на сервер"
+        retries = UPLOAD_RETRIES if st.phase == "upload" else DOWNLOAD_RETRIES
+        attempt_note = f" (попытка {st.attempt}/{retries})" if st.attempt > 1 else ""
+        pause_note = "\n⏸ Жду перед повторной попыткой…" if st.waiting else ""
+        return (
+            f"{icon} {label} «{job.filename}»{attempt_note}\n"
             f"[{make_progress_bar(pct)}] {pct}%\n"
-            f"{format_size(current)} / {format_size(total)} · {format_speed(speed)} · ~{format_eta(eta)}"
+            f"{format_size(st.current)} / {format_size(total)} · {format_speed(speed)} · ~{format_eta(eta)}"
             f"{pause_note}"
         )
-        if shown != last_shown:
-            try:
-                await status.edit(shown)
-                last_shown = shown
-            except Exception as e:
-                log.debug("Не удалось обновить прогресс: %s", e)
+
+    def _line(self, item: BatchItem, now: float) -> str:
+        name = short_name(item.job.filename)
+        st = item.state
+        if item.status == "queued":
+            return f"⏳ {name}"
+        if item.status == "ok":
+            line = f"✅ {name}"
+            if item.where:
+                line += f" → {short_name(item.where, 50)}"
+            if item.replaced:
+                line += " (заменён)"
+            return line
+        if item.status == "error":
+            return f"❌ {name} — {item.error}"
+        if st.phase == "convert":
+            return f"🎧 {name} — достаю звук"
+        if st.phase == "upload" and st.current >= st.total:
+            return f"📤 {name} — проверяю на сервере"
+        speed, _eta = item.meter.measure(st, now)
+        pct = min(100, int(st.current / max(st.total, 1) * 100))
+        icon = "📥" if st.phase == "download" else "📤"
+        pause = " ⏸" if st.waiting else ""
+        return f"{icon} {name} — {pct}% · {format_speed(speed)}{pause}"
+
+
+def join_batch(chat_id: int, send, item: BatchItem) -> Batch:
+    batch = BATCHES.get(chat_id)
+    if batch is None or batch.closed:
+        batch = Batch(chat_id, send)
+        BATCHES[chat_id] = batch
+    batch.add(item)
+    return batch
 
 
 async def with_stall_watchdog(coro, state: TransferState):
@@ -937,7 +1369,7 @@ async def with_stall_watchdog(coro, state: TransferState):
                 await task
 
 
-# ---------- скачивание из Telegram (с докачкой) ----------
+# ---------- скачивание из Telegram (параллельно, с докачкой) ----------
 async def refresh_message(message):
     """Перечитываем сообщение: file reference в старом объекте мог протухнуть."""
     try:
@@ -948,48 +1380,154 @@ async def refresh_message(message):
         return message
 
 
-async def download_resumable(message, local_path: Path, state: TransferState, attempt: int) -> None:
-    """Качает документ, продолжая с места обрыва, если часть файла уже есть на диске."""
-    doc = message.document
+def read_resume_point(local_path: Path, doc) -> int:
+    """Сколько байт с НАЧАЛА файла уже точно скачано (кратно DOWNLOAD_SEGMENT либо весь файл).
+    Сегменты качаются параллельно и ложатся в файл вразнобой, поэтому по размеру файла о докачке судить нельзя —
+    надёжная граница хранится в «паспорте» рядом с файлом."""
+    try:
+        data = json.loads(meta_path(local_path).read_text(encoding="utf-8"))
+        have = local_path.stat().st_size
+        done = int(data.get("done", 0))
+    except (OSError, ValueError, TypeError):
+        return 0
     total = doc.size or 0
+    if (
+        data.get("doc_id") != doc.id or data.get("size") != total
+        or data.get("segment") != DOWNLOAD_SEGMENT or done < 0 or done > total or done > have
+    ):
+        return 0
+    return done
 
-    offset = 0
-    if local_path.exists():
-        existing = local_path.stat().st_size
-        if existing > total:  # мусор от чего-то другого — начинаем заново
-            remove_quietly(local_path)
-        else:
-            offset = (existing // RESUME_ALIGN) * RESUME_ALIGN  # Telegram требует выровненный offset
-    if offset:
-        log.info("Докачиваю «%s» с %s из %s", state.filename, format_size(offset), format_size(total))
 
-    state.begin("download", attempt, current=offset, total=total or 1)
-    state.disk_reserved = max(total - offset, 0)
+def write_resume_point(local_path: Path, doc, done: int) -> None:
+    payload = {"doc_id": doc.id, "size": doc.size or 0, "segment": DOWNLOAD_SEGMENT, "done": done}
+    target = meta_path(local_path)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as e:
+        log.debug("Не удалось записать прогресс докачки: %s", e)
 
-    with open(local_path, "r+b" if offset else "wb") as f:
-        if offset:
-            f.seek(offset)
-            f.truncate()
-        async for chunk in client.iter_download(
-            doc, offset=offset, request_size=DOWNLOAD_REQUEST_SIZE, file_size=total or None
-        ):
+
+async def _pwrite_all(fd: int, data: bytes, pos: int) -> None:
+    view = memoryview(data)
+    while len(view):
+        written = await run_blocking(os.pwrite, fd, view, pos)
+        view = view[written:]
+        pos += written
+
+
+async def download_unknown_size(message, local_path: Path, state: TransferState, attempt: int) -> None:
+    """Запасной путь: Telegram не сообщил размер документа — качаем одним потоком без докачки."""
+    remove_quietly(meta_path(local_path))
+    state.begin("download", attempt, current=0, total=1)
+    with open(local_path, "wb") as f:
+        async for chunk in client.iter_download(message.document, request_size=DOWNLOAD_REQUEST_SIZE):
             await run_blocking(f.write, chunk)
             state.current += len(chunk)
-            state.disk_reserved = max(total - state.current, 0)
+            state.total = max(state.total, state.current)
+
+
+async def download_resumable(message, local_path: Path, state: TransferState, attempt: int) -> None:
+    """Качает документ сегментами по DOWNLOAD_SEGMENT, DOWNLOAD_WORKERS штук одновременно, и продолжает с места
+    обрыва: в «паспорте» (файл .meta) хранится граница, до которой все сегменты подряд скачаны полностью.
+    Это работает и между попытками, и между перезапусками бота."""
+    doc = message.document
+    total = doc.size or 0
+    if total <= 0:
+        await download_unknown_size(message, local_path, state, attempt)
+        return
+
+    nseg = (total + DOWNLOAD_SEGMENT - 1) // DOWNLOAD_SEGMENT
+    done = read_resume_point(local_path, doc)
+    first = nseg if done >= total else done // DOWNLOAD_SEGMENT
+    if done:
+        log.info("Докачиваю «%s» с %s из %s", state.filename, format_size(done), format_size(total))
+    else:
+        remove_quietly(local_path)  # без паспорта содержимому не верим
+
+    state.begin("download", attempt, current=done, total=total)
+    state.disk_reserved = max(total - done, 0)
+
+    pending = deque(range(first, nseg))
+    finished = set()
+    prefix = first  # сегменты [0, prefix) скачаны целиком
+    persist_lock = asyncio.Lock()
+
+    async def persist() -> None:
+        async with persist_lock:
+            await run_blocking(write_resume_point, local_path, doc, min(prefix * DOWNLOAD_SEGMENT, total))
+
+    fd = os.open(local_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        async def fetch_segment(idx: int) -> None:
+            start = idx * DOWNLOAD_SEGMENT
+            end = min(start + DOWNLOAD_SEGMENT, total)
+            chunks = (end - start + DOWNLOAD_REQUEST_SIZE - 1) // DOWNLOAD_REQUEST_SIZE
+            pos = start
+            async for chunk in client.iter_download(
+                doc, offset=start, limit=chunks, request_size=DOWNLOAD_REQUEST_SIZE, file_size=total
+            ):
+                chunk = chunk[: end - pos]
+                if not chunk:
+                    break
+                await _pwrite_all(fd, chunk, pos)
+                pos += len(chunk)
+                state.current += len(chunk)
+                state.disk_reserved = max(total - state.current, 0)
+                if pos >= end:
+                    break
+            if pos != end:
+                raise TransferError(
+                    f"Telegram отдал неполный фрагмент файла ({format_size(pos - start)} из {format_size(end - start)})",
+                    retriable=True,
+                )
+
+        async def worker() -> None:
+            nonlocal prefix
+            while pending:
+                idx = pending.popleft()
+                await fetch_segment(idx)
+                finished.add(idx)
+                advanced = False
+                while prefix in finished:
+                    finished.discard(prefix)
+                    prefix += 1
+                    advanced = True
+                if advanced:
+                    await persist()
+
+        tasks = [asyncio.create_task(worker()) for _ in range(min(DOWNLOAD_WORKERS, len(pending)))]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            with contextlib.suppress(Exception):
+                await persist()  # то, что успели докачать подряд, сохраняем для следующей попытки
+            raise
+    finally:
+        os.close(fd)
 
     state.disk_reserved = 0
     got = local_path.stat().st_size
-    if total and got != total:
+    if got != total:
         remove_quietly(local_path)  # битый результат — следующая попытка начнёт с нуля
+        remove_quietly(meta_path(local_path))
         raise TransferError(
             f"скачанный файл неполный ({format_size(got)} из {format_size(total)})", retriable=True
         )
+    # Паспорт с «done = всё» остаётся рядом: если бот упадёт во время отправки на сервер, после перезапуска
+    # файл не придётся качать заново. Уберёт его уже завершённое задание (drop_job_files).
+    await run_blocking(write_resume_point, local_path, doc, total)
 
 
 async def download_with_retry(message, local_path: Path, state: TransferState) -> None:
     """Скачивание из Telegram с повторными попытками.
     * Каждая попытка идёт под своим watchdog-ом: зависание — это повторяемая ошибка. Недокачанный файл
-      остаётся на диске, и следующая попытка продолжает с последней выровненной границы.
+      остаётся на диске, и следующая попытка продолжает с последней сохранённой границы.
     * FloodWait ждём ровно столько, сколько просит Telegram, не тратя обычный лимит попыток, но суммарно
       не дольше MAX_FLOOD_WAIT_SEC — на время ожидания мы занимаем слот очереди."""
     last_exc = None
@@ -1035,8 +1573,9 @@ async def download_with_retry(message, local_path: Path, state: TransferState) -
 
 # ---------- загрузка на copyparty ----------
 def remote_url(base: str, filename: str) -> str:
-    """Имя файла обязательно кодируем: иначе «#», «?», «%» в названии ломают URL."""
-    return f"{base.rstrip('/')}/{quote(filename, safe='')}"
+    """Имя (или путь «папка/подпапка/файл») обязательно кодируем по частям: иначе «#», «?», «%» в названии
+    ломают URL, а «/» между папками должен остаться разделителем."""
+    return f"{base.rstrip('/')}/" + "/".join(quote(part, safe="") for part in filename.split("/"))
 
 
 async def upload_stream(path: Path, state: TransferState):
@@ -1079,6 +1618,9 @@ _PERMS_CACHE: dict = {}
 # Параллельные загрузки в одно и то же имя выстраиваем в очередь (ключ — URL файла); записи живут,
 # пока кто-то держит замок.
 _NAME_LOCKS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
+# Поиск/создание папок сериала — под одним замком, иначе две серии нового сериала, пришедшие одновременно,
+# создадут две папки («Show» и «show»).
+_SERIES_LOCK = asyncio.Lock()
 
 
 def name_lock(key: str) -> asyncio.Lock:
@@ -1089,10 +1631,13 @@ def name_lock(key: str) -> asyncio.Lock:
     return lock
 
 
-def new_temp_name() -> str:
-    # Короткое ASCII-имя без точки в начале: не упирается в лимит длины и не прячется как dotfile.
-    # Расширение «.part» не распознают ни Jellyfin, ни индексатор тегов.
-    return f"upload-{uuid.uuid4().hex[:12]}.part"
+def new_temp_name(final_name: str = "") -> str:
+    """Временный файл лежит В ТОЙ ЖЕ папке, что и итоговый (иначе MOVE пойдёт между папками).
+    Короткое ASCII-имя без точки в начале: не упирается в лимит длины и не прячется как dotfile.
+    Расширение «.part» не распознают ни Jellyfin, ни индексатор тегов."""
+    folder = final_name.rpartition("/")[0]
+    leaf = f"upload-{uuid.uuid4().hex[:12]}.part"
+    return f"{folder}/{leaf}" if folder else leaf
 
 
 async def get_remote_perms(url, user, pw) -> Optional[frozenset]:
@@ -1113,6 +1658,88 @@ async def get_remote_perms(url, user, pw) -> Optional[frozenset]:
         log.debug("Не удалось узнать права на %s: %s", url, e)
     _PERMS_CACHE[url] = (now, perms)
     return perms
+
+
+async def list_remote_dirs(url, user, pw, segments: list) -> Optional[list]:
+    """Имена подпапок в папке на сервере (по «?ls»). [] — папки нет; None — узнать не удалось."""
+    path = "/".join(quote(s, safe="") for s in segments)
+    base = f"{url.rstrip('/')}/" + (f"{path}/" if path else "")
+    try:
+        resp = await http.get(base + "?ls", auth=(user, pw), timeout=30)
+    except httpx.HTTPError as e:
+        log.warning("Не удалось получить список папок «%s»: %s", "/".join(segments) or "/", e)
+        return None
+    if resp.status_code == 404:
+        return []
+    if resp.status_code != 200:
+        log.warning("Список папок «%s»: сервер вернул %s", "/".join(segments) or "/", resp.status_code)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    names = []
+    for entry in data.get("dirs") or []:
+        href = entry.get("href") if isinstance(entry, dict) else entry
+        if not isinstance(href, str):
+            continue
+        name = unquote(href).strip("/").rsplit("/", 1)[-1]
+        if name:
+            names.append(name)
+    return names
+
+
+async def ensure_remote_dirs(url, user, pw, segments: list) -> None:
+    """Создаёт вложенные папки (WebDAV MKCOL). Сбой не фатален: возможно, copyparty создаст папки сам при
+    загрузке, а если нет — загрузка честно упадёт со своей ошибкой."""
+    path = ""
+    for seg in segments:
+        path = f"{path}/{seg}" if path else seg
+        try:
+            resp = await http.request(
+                "MKCOL", remote_url(url, path) + "/", auth=(user, pw), timeout=HTTP_DEFAULT_TIMEOUT
+            )
+        except httpx.HTTPError as e:
+            log.warning("Не удалось создать папку «%s»: %s: %s", path, type(e).__name__, e)
+            return
+        if resp.status_code in OK_MKCOL_STATUSES:
+            continue
+        log.warning(
+            "Не удалось создать папку «%s» (%s %s) — проверьте, что у пользователя copyparty есть право write",
+            path, resp.status_code, resp.text[:200],
+        )
+        return
+
+
+async def resolve_series_dirs(url, user, pw, show: str, season: int) -> list:
+    """Папки для серии: [«Название сериала», «Season 01»]. Если такой сериал уже лежит в другой записи
+    («dune prophecy», «Dune: Prophecy», «Dune Prophecy (2024)») — берём существующую папку, а не заводим новую.
+    То же для сезона («Season 1», «Сезон 01»). Недостающие папки создаются."""
+    show = truncate_dirname(show)
+    season_dir = f"Season {season:02d}"
+    async with _SERIES_LOCK:
+        show_dir = show
+        found = False
+        root = await list_remote_dirs(url, user, pw, [])
+        if root:
+            if show in root:
+                found = True
+            else:
+                key = series_key(show)
+                if key:
+                    for name in sorted(root, key=str.casefold):
+                        if series_key(name) == key:
+                            show_dir, found = name, True
+                            break
+        if found:
+            seasons = await list_remote_dirs(url, user, pw, [show_dir]) or []
+            if season_dir not in seasons:
+                for name in sorted(seasons, key=str.casefold):
+                    if season_number(name) == season:
+                        season_dir = name
+                        break
+        await ensure_remote_dirs(url, user, pw, [show_dir, season_dir])
+    return [show_dir, season_dir]
 
 
 async def delete_remote_quietly(url, user, pw, name) -> bool:
@@ -1218,9 +1845,10 @@ async def _upload_once(url, user, pw, put_name, final_name, local_path: Path, fi
 
 async def upload_with_retry(url, user, pw, filename, local_path: Path, state: TransferState) -> bool:
     """Заливает файл на copyparty. Возвращает True, если файл с таким именем там уже был (и заменён).
+    filename — путь относительно корня: «Файл.mp3» или «Сериал/Season 01/Файл.mkv» (папки уже должны существовать).
 
-    Схема (UPLOAD_VIA_TEMP=1, по умолчанию): PUT во временный «upload-<id>.part» → проверка размера →
-    MOVE на итоговое имя. Так на сервере никогда не появляется обрезанный файл под настоящим именем,
+    Схема (UPLOAD_VIA_TEMP=1, по умолчанию): PUT во временный «upload-<id>.part» (в той же папке) → проверка
+    размера → MOVE на итоговое имя. Так на сервере никогда не появляется обрезанный файл под настоящим именем,
     а существующий файл заменяется целиком или остаётся нетронутым. (Прямой PUT поверх существующего copyparty
     не перезаписывает, а создаёт копию «имя-<время>-<id>.ext»; обрыв оставляет обрезок, и повтор плодит копии.)
     Если прав move нет — честно грузим напрямую, предварительно убрав обрывки.
@@ -1257,7 +1885,7 @@ async def upload_with_retry(url, user, pw, filename, local_path: Path, state: Tr
                 state.begin("upload", attempt, current=0, total=file_size)
                 delay = RETRY_BACKOFF_SEC * attempt
                 use_temp = use_temp_ok and not force_direct
-                put_name = new_temp_name() if use_temp else filename
+                put_name = new_temp_name(filename) if use_temp else filename
                 # Временный файл стираем всегда; «настоящий» — только если до нас его не было.
                 partial_name = put_name if (use_temp or not existed) else None
                 try:
@@ -1383,29 +2011,64 @@ async def extract_audio(src: Path, dst: Path, filename: str) -> None:
 
 
 # ---------- обработка одного файла ----------
-async def transfer_file(
-    message, kind: str, filename: str, local_path: Path, state: TransferState, extract: bool = False
-) -> bool:
-    """Скачать → (клип) достать звук → (для mp3) починить теги → залить.
-    Возвращает True, если файл с таким именем уже был."""
-    ensure_disk_space(message.document.size or 0, state)
+async def transfer_file(message, job: Job, local_path: Path, state: TransferState) -> tuple:
+    """Скачать → (клип) достать звук → (для mp3) починить теги → (сериал) найти/создать папки → залить.
+    Возвращает (файл_с_таким_именем_уже_был, папка_на_сервере_или_пустая_строка)."""
+    already = read_resume_point(local_path, message.document) if local_path.exists() else 0
+    ensure_disk_space(max((message.document.size or 0) - already, 0), state)
     await download_with_retry(message, local_path, state)
 
     upload_path = local_path
     audio_path = local_path.with_suffix(".m4a")
     try:
-        if extract:
+        if job.extract:
             state.begin("convert", 1, current=0, total=1)
-            await extract_audio(local_path, audio_path, filename)
+            await extract_audio(local_path, audio_path, job.filename)
             upload_path = audio_path
 
-        if kind == "music" and Path(filename).suffix.lower() == ".mp3":
+        if job.kind == "music" and Path(job.filename).suffix.lower() == ".mp3":
             await run_blocking(fix_mp3_tags, str(upload_path))
 
-        url, user, pw = TARGETS[kind]
-        return await upload_with_retry(url, user, pw, filename, upload_path, state)
+        url, user, pw = TARGETS[job.kind]
+        remote_name = job.filename
+        where = ""
+        if job.kind == "movie" and job.series:
+            # Папки ищем/создаём только сейчас, перед отправкой: за время скачивания их мог создать другой файл.
+            dirs = await resolve_series_dirs(url, user, pw, job.series["show"], int(job.series["season"]))
+            remote_name = "/".join(dirs + [job.filename])
+            where = "/".join(dirs)
+        existed = await upload_with_retry(url, user, pw, remote_name, upload_path, state)
+        return existed, where
     finally:
         remove_quietly(audio_path)
+
+
+async def run_job(job: Job, message, send) -> None:
+    """Ставит файл в общую пачку, ждёт своей очереди, переносит и записывает результат.
+    Временные файлы и запись в журнале удаляются, только когда задание ДОВЕДЕНО до конца (успехом или
+    окончательной ошибкой). При остановке бота они остаются — после запуска задание продолжится."""
+    item = BatchItem(job=job, state=TransferState(filename=job.filename, total=job.size or 1))
+    batch = join_batch(job.chat_id, send, item)
+    finished = False
+    try:
+        await batch.ensure_status()
+        async with UPLOAD_SEMAPHORE:
+            item.status = "running"
+            ACTIVE_TRANSFERS.add(item.state)
+            try:
+                # Watchdog на зависания работает внутри transfer_file — на каждой попытке скачивания/отправки.
+                existed, where = await transfer_file(message, job, job.local_path, item.state)
+                item.mark_ok(existed, where)
+            except Exception as e:
+                log.exception("upload failed")
+                item.mark_error(describe_error(e))
+            finally:
+                ACTIVE_TRANSFERS.discard(item.state)
+        finished = True
+    finally:
+        if finished:
+            drop_job_files(job)
+        batch.item_finished()
 
 
 # ---------- вопросы пользователю (кнопки у бота-помощника или текстовый ответ) ----------
@@ -1415,11 +2078,17 @@ KIND_ALIASES = {
     "2": "movie", "ф": "movie", "фильм": "movie", "видео": "movie", "movie": "movie",
     "0": "cancel", "отмена": "cancel", "нет": "cancel", "cancel": "cancel",
 }
+VIDEO_KIND_ALIASES = {
+    "1": "movie", "ф": "movie", "фильм": "movie", "movie": "movie",
+    "2": "series", "с": "series", "сериал": "series", "series": "series",
+    "0": "cancel", "отмена": "cancel", "нет": "cancel", "cancel": "cancel",
+}
 YES_ALIASES = {
     "да": "yes", "д": "yes", "yes": "yes", "y": "yes", "1": "yes",
     "нет": "cancel", "н": "cancel", "no": "cancel", "n": "cancel", "0": "cancel",
     "отмена": "cancel", "cancel": "cancel",
 }
+CANCEL_WORDS = {"0", "отмена", "cancel"}
 
 
 def sender_allowed(sender_id) -> bool:
@@ -1434,10 +2103,15 @@ def resolve_text_choice(event) -> bool:
     if entry is None:
         return False
     fut, aliases = entry
-    choice = aliases.get(event.raw_text.strip().lower())
-    if choice is None or fut.done():
+    text = event.raw_text.strip()
+    if aliases is None:
+        # ждём произвольный текст; отмена — пустая строка (None оставляем для «не дождались»)
+        value = "" if text.lower() in CANCEL_WORDS else (text or None)
+    else:
+        value = aliases.get(text.lower())
+    if value is None or fut.done():
         return False
-    fut.set_result(choice)
+    fut.set_result(value)
     return True
 
 
@@ -1499,9 +2173,43 @@ async def ask_choice(event, question: str, rows: list, aliases: dict, hint: str,
     return choice
 
 
+async def ask_text(event, question: str, hint: str) -> Optional[str]:
+    """Просит ввести текст (ответом на сообщение бота). Возвращает текст; «» — пользователь отменил;
+    None — не дождались ответа."""
+    fut = asyncio.get_running_loop().create_future()
+    prompt = await event.reply(f"{question}\nОтветьте на это сообщение: {hint}. (0 — отмена)")
+    key = ("reply", event.chat_id, prompt.id)
+    PENDING_CHOICES[key] = (fut, None)
+    try:
+        answer = await asyncio.wait_for(fut, timeout=CHOICE_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        answer = None
+    finally:
+        PENDING_CHOICES.pop(key, None)
+
+    if answer is None:
+        note = "⌛ Ответа не дождался — файл пропущен."
+    elif answer == "":
+        note = "✖️ Отменено."
+    else:
+        note = f"✅ Принял: {answer}"
+    await safe_edit(prompt, note)
+    return answer
+
+
 def _kind_note(choice: Optional[str]) -> str:
     if choice in KIND_LABELS:
         return f"✅ Понял, кладу в {KIND_LABELS[choice]}."
+    if choice is None:
+        return "⌛ Ответа не дождался — файл пропущен."
+    return "✖️ Отменено."
+
+
+def _video_kind_note(choice: Optional[str]) -> str:
+    if choice == "movie":
+        return "✅ Понял: это фильм."
+    if choice == "series":
+        return "✅ Понял: это серия сериала."
     if choice is None:
         return "⌛ Ответа не дождался — файл пропущен."
     return "✖️ Отменено."
@@ -1518,6 +2226,71 @@ async def ask_kind(event, filename: str) -> Optional[str]:
         _kind_note,
     )
     return choice if choice in KIND_LABELS else None
+
+
+async def plan_video(event, orig_filename: str, ext: str, parsed: Optional[dict], filename: str):
+    """Фильм это или серия сериала. Если из имени и подписи не понять — спрашивает пользователя.
+    Возвращает (series, имя_файла): series — {"show", "season"} для серии, None для фильма;
+    либо None, если файл надо пропустить (отмена, нет ответа, ответ не разобрали)."""
+    info = detect_series(orig_filename, parsed)
+
+    if info is None and is_generic_name(Path(filename).stem):
+        # Ни имя файла, ни подпись ничего не говорят («video_123.mp4») — что это, пусть скажет пользователь.
+        choice = await ask_choice(
+            event,
+            f"🤔 Не понимаю, что за видео: «{orig_filename}».\nЭто фильм или серия сериала?",
+            [[("🎬 Фильм", "movie"), ("📺 Сериал", "series")], [("✖️ Отмена", "cancel")]],
+            VIDEO_KIND_ALIASES,
+            "1 — фильм, 2 — сериал, 0 — отмена",
+            _video_kind_note,
+        )
+        if choice == "movie":
+            text = await ask_text(
+                event, f"🎬 Как называется фильм? (файл «{orig_filename}»)",
+                "название, лучше с годом — например: Dune (2021)",
+            )
+            name = sanitize_name(text or "")
+            if not name:
+                return None
+            return None, truncate_filename(name + ext)
+        if choice == "series":
+            text = await ask_text(
+                event, f"📺 Что это за серия? (файл «{orig_filename}»)",
+                "название, сезон и серия — например: Dune Prophecy S01E02",
+            )
+            parsed_answer = parse_episode_from_name(normalize_text(text or ""))
+            if not parsed_answer or not parsed_answer["show"] or is_generic_name(parsed_answer["show"]):
+                if text:
+                    await event.reply("🤷 Не разобрал название, сезон и серию (нужен вид «Название S01E02») — файл пропущен.")
+                return None
+            info = {
+                "show": parsed_answer["show"], "season": parsed_answer["season"],
+                "episode": parsed_answer["episode"], "episode_title": None, "quality": None, "name_ok": False,
+            }
+        else:
+            return None
+
+    if info is None:
+        return None, filename  # обычный фильм
+
+    show = info["show"]
+    if not show or is_generic_name(show):
+        text = await ask_text(
+            event,
+            f"📺 «{orig_filename}» — серия сериала (сезон {info['season']}, серия {info['episode']}), "
+            f"но название сериала я не нашёл.",
+            "название сериала — например: Dune Prophecy",
+        )
+        show = clean_show_name(text or "")
+        if not show or is_generic_name(show):
+            if text:
+                await event.reply("🤷 Не разобрал название сериала — файл пропущен.")
+            return None
+        info["name_ok"] = False
+
+    info["show"] = show
+    leaf = orig_filename if info["name_ok"] else build_series_filename(info, ext)
+    return {"show": show, "season": info["season"]}, truncate_filename(leaf)
 
 
 async def on_choice_button(event):
@@ -1873,6 +2646,7 @@ async def handle_library_command(event) -> None:
         await event.reply(f"❌ Не получилось: {describe_error(e)}.")
 
 
+# ---------- входящие сообщения ----------
 @client.on(events.NewMessage(incoming=True))
 async def handle_dm(event):
     if not event.is_private:
@@ -1882,9 +2656,27 @@ async def handle_dm(event):
         log.info("Игнорирую сообщение от чужого sender_id=%s", event.sender_id)
         return
 
+    if not (event.media and event.document):
+        await process_message(event)
+        return
+
+    # Защита от повторной обработки: сообщение уже в работе или будет продолжено после перезапуска
+    # (catch_up мог прислать его заново).
+    key = (event.chat_id, event.message.id)
+    if key in ACTIVE_JOBS:
+        log.info("Сообщение %s уже обрабатывается — пропускаю повтор", event.message.id)
+        return
+    ACTIVE_JOBS.add(key)
+    try:
+        await process_message(event)
+    finally:
+        ACTIVE_JOBS.discard(key)
+
+
+async def process_message(event):
     doc = event.document
     if not event.media or not doc:
-        if resolve_text_choice(event):  # ответ на вопрос бота («1/2/0», «да/нет»)
+        if resolve_text_choice(event):  # ответ на вопрос бота («1/2/0», «да/нет», название)
             return
         if event.raw_text and event.raw_text.startswith("/"):
             await handle_library_command(event)
@@ -1986,62 +2778,50 @@ async def handle_dm(event):
             )
     filename = truncate_filename(filename)
 
-    size = doc.size or 0
-    status = await event.reply(f"⏳ Принял «{filename}» ({size / 1024 / 1024:.0f} МБ), жду очереди…")
+    # Видео: фильм или серия сериала (и если не понять — спрашиваем). Клип, из которого достаём звук, — не сериал.
+    series = None
+    if kind == "movie" and not extract_audio_flag:
+        plan = await plan_video(event, orig_filename, ext, parsed, filename)
+        if plan is None:
+            return
+        series, filename = plan
 
-    # Имя временного файла не зависит от названия (длинные/странные имена не ломают ФС),
-    # а пара sender_id + message.id уникальна между разными отправителями.
-    local_path = TMP_DIR / f"{event.sender_id}_{event.message.id}.part"
+    job = Job(
+        chat_id=event.chat_id,
+        sender_id=event.sender_id,
+        message_id=event.message.id,
+        kind=kind,
+        filename=filename,
+        size=doc.size or 0,
+        extract=extract_audio_flag,
+        series=series,
+    )
+    journal_write(job)  # с этого момента задание переживёт перезапуск бота
+    await run_job(job, event.message, event.reply)
 
-    async with UPLOAD_SEMAPHORE:
-        state = TransferState(filename=filename, total=size or 1)
-        ACTIVE_TRANSFERS.add(state)
-        stop_event = asyncio.Event()
-        updater_task = asyncio.create_task(progress_updater(status, state, stop_event))
 
-        async def stop_updater():
-            # Останавливаем апдейтер ДО финального сообщения, иначе он может затереть его старым прогрессом.
-            stop_event.set()
-            await updater_task
-
-        final_text = None
-        try:
-            # Watchdog на зависания работает внутри transfer_file — на каждой попытке скачивания/отправки.
-            existed = await transfer_file(event.message, kind, filename, local_path, state, extract_audio_flag)
-            await stop_updater()
-
-            note = "\n⚠️ Файл с таким именем уже был на сервере — заменён." if existed else ""
-            if kind == "music":
-                final_text = (
-                    f"✅ Готово: «{filename}»\n"
-                    f"📁 Загружено в музыку — теги проставятся автоматически в течение ~10 минут.{note}"
-                )
-            else:
-                scan = await refresh_jellyfin()
-                if scan is True:
-                    suffix = "\n🔄 Сканирование Jellyfin запущено."
-                elif scan is False:
-                    suffix = "\n⚠️ Jellyfin не ответил — запустите сканирование библиотеки вручную."
-                else:
-                    suffix = ""
-                final_text = f"✅ Готово: «{filename}»\n📁 Загружено в фильмы.{suffix}{note}"
-
-        except Exception as e:
-            log.exception("upload failed")
-            final_text = f"❌ Не удалось загрузить «{filename}»: {describe_error(e)}."
-        finally:
-            ACTIVE_TRANSFERS.discard(state)
-            await stop_updater()
-            remove_quietly(local_path)
-
-    if final_text:
-        await safe_edit(status, final_text)
+async def resume_one(job: Job) -> None:
+    """Продолжает задание, прерванное остановкой бота."""
+    try:
+        message = await client.get_messages(job.chat_id, ids=job.message_id)
+        if not message or not message.document:
+            log.warning("Сообщение %s пропало — задание «%s» отбрасываю", job.message_id, job.filename)
+            drop_job_files(job)
+            return
+        log.info("Продолжаю после перезапуска: «%s»", job.filename)
+        await run_job(job, message, functools.partial(client.send_message, job.chat_id))
+    except Exception:
+        log.exception("Не удалось продолжить задание «%s»", job.filename)
+    finally:
+        ACTIVE_JOBS.discard(job.key)
 
 
 async def main():
     global http, UPLOAD_SEMAPHORE
     UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
-    prepare_tmp_dir()
+    pending_jobs = prepare_tmp_dir()
+    for job in pending_jobs:
+        ACTIVE_JOBS.add(job.key)  # чтобы catch_up не запустил то же сообщение второй раз
     http = httpx.AsyncClient(
         timeout=HTTP_DEFAULT_TIMEOUT,
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=4),
@@ -2059,6 +2839,10 @@ async def main():
             "Userbot started as %s (id=%s), watching DMs from %s, version %s",
             me.username, me.id, ALLOWED_SENDER_IDS or "ВСЕХ (!)", BOT_VERSION,
         )
+        for job in pending_jobs:
+            job.starts += 1
+            journal_write(job)
+            spawn(resume_one(job))
         await client.run_until_disconnected()
     finally:
         # Закрываем клиента явно: иначе сессия (sqlite) и состояние для catch_up могут сохраниться не до конца.
