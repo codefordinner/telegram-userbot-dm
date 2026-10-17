@@ -48,6 +48,10 @@ Userbot: принимает в личку музыку/видео и залив�
   * BATCH_GRACE_SEC    — сколько секунд после последнего файла ждать новых, прежде чем закрыть общий статус
                          пачки/альбома и запустить один скан Jellyfin (по умолчанию 4)
 
+  Ещё новое: HISTORY_DB, DUPLICATE_CHECK, LINK_INGEST, YTDLP_BIN, YTDLP_COOKIES, YTDLP_EXTRA_ARGS,
+  YTDLP_TIMEOUT_SEC, LINK_MAX_ENTRIES, LINK_VIDEO_MAX_HEIGHT, LINK_EMBED_THUMB, SUBTITLE_RECODE,
+  SUBTITLE_FALLBACK_ENCODING — описаны в блоке «Новое» перед командами библиотеки.
+
 Сериалы (видео с «S01E02» / «1x02» в имени или «N сезон M серия» в подписи) раскладываются по папкам:
   <Название сериала>/Season 01/<файл>. Год в названии папки не используется; если папка сериала уже есть
   (с другим регистром, знаками или годом — «Dune (2021)»), серия кладётся в неё. Если не удаётся понять,
@@ -66,6 +70,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import time
 import unicodedata
 import uuid
@@ -74,7 +79,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 from telethon import Button, TelegramClient, events
@@ -86,6 +91,7 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
 )
 from mutagen.id3 import ID3, ID3NoHeaderError
+from mutagen.mp4 import MP4
 
 logging.basicConfig(level=logging.INFO)
 # httpx на уровне INFO пишет в лог полные URL запросов, включая ?api_key=... для Jellyfin.
@@ -127,6 +133,7 @@ TARGETS = {
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".mka"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
 # Контейнеры, в которых бывает и звук без картинки (трек, присланный как «.mp4»): для музыки меняем на .m4a.
 MP4_FAMILY_EXTS = {".mp4", ".m4v", ".mov"}
 # «.ts» — это и MPEG-TS, и TypeScript (Telegram даже присылает его как video/mp2t), поэтому
@@ -214,7 +221,7 @@ MUSIC_VIDEO_UNKNOWN_DURATION_MAX_BYTES = 150 * 1024 * 1024  # если Telegram 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", "600"))
-BOT_VERSION = "2026-10-16-series-batches-resume"  # пишется в лог при старте: по нему видно, какая версия реально запущена
+BOT_VERSION = "2026-10-17-history-subs-dupes-links"  # пишется в лог при старте: по нему видно, какая версия реально запущена
 
 # Управление библиотекой через beets (команды /find /rename /del …).
 LIBRARY_ADMIN = env_flag("LIBRARY_ADMIN", True)
@@ -375,20 +382,28 @@ class Job:
     extract: bool = False  # достать звук из клипа
     series: Optional[dict] = None  # {"show": «Название», "season": 1} — серия сериала
     starts: int = 0  # сколько раз задание возобновляли после перезапуска
+    url: Optional[str] = None  # скачивать не из Telegram, а по ссылке (yt-dlp)
+    part: int = 0  # номер элемента в плейлисте (у заданий по ссылке ≥ 1)
+    subtitle: bool = False  # файл субтитров: имя подбирается под видео на сервере
+    force: bool = False  # не проверять дубликаты
 
     @property
     def key(self) -> tuple:
+        if self.part:
+            return (self.chat_id, self.message_id, self.part)
         return (self.chat_id, self.message_id)
 
     @property
     def local_path(self) -> Path:
         # Имя временного файла не зависит от названия (длинные/странные имена не ломают ФС),
         # а пара sender_id + message.id уникальна между разными отправителями.
-        return TMP_DIR / f"{self.sender_id}_{self.message_id}.part"
+        tail = f"_{self.part}" if self.part else ""
+        return TMP_DIR / f"{self.sender_id}_{self.message_id}{tail}.part"
 
     @property
     def journal_path(self) -> Path:
-        return JOURNAL_DIR / f"{self.sender_id}_{self.message_id}.json"
+        tail = f"_{self.part}" if self.part else ""
+        return JOURNAL_DIR / f"{self.sender_id}_{self.message_id}{tail}.json"
 
 
 def describe_status(code: int) -> str:
@@ -446,6 +461,8 @@ def classify(
     «Artist - Title.mp4») по расширению выглядит как видео, поэтому сначала смотрим на атрибуты и mime."""
     ext = Path(filename).suffix.lower()
     mime = (mime_type or "").lower()
+    if ext in SUBTITLE_EXTS:
+        return "subtitle"
     if ext in AUDIO_EXTS:
         return "music"
     if ext in VIDEO_EXTS:
@@ -616,6 +633,9 @@ def drop_job_files(job: Job) -> None:
     remove_quietly(job.local_path)
     remove_quietly(meta_path(job.local_path))
     remove_quietly(job.local_path.with_suffix(".m4a"))
+    if job.url:  # файлы yt-dlp: «<имя>.mp4/.m4a/.info.json/.webm.part …»
+        for p in TMP_DIR.glob(job.local_path.stem + ".*"):
+            remove_quietly(p)
     remove_quietly(job.journal_path)
 
 
@@ -1278,7 +1298,8 @@ class Batch:
     def _render_single(self, item: BatchItem, now: float) -> str:
         job, st = item.job, item.state
         if item.status == "queued":
-            return f"⏳ Принял «{job.filename}» ({job.size / 1024 / 1024:.0f} МБ), жду очереди…"
+            size_note = f" ({job.size / 1024 / 1024:.0f} МБ)" if job.size else ""
+            return f"⏳ Принял «{job.filename}»{size_note}, жду очереди…"
         if item.status in ("ok", "error"):
             return item.final_text
         if st.phase == "convert":
@@ -2014,11 +2035,13 @@ async def extract_audio(src: Path, dst: Path, filename: str) -> None:
 async def transfer_file(message, job: Job, local_path: Path, state: TransferState) -> tuple:
     """Скачать → (клип) достать звук → (для mp3) починить теги → (сериал) найти/создать папки → залить.
     Возвращает (файл_с_таким_именем_уже_был, папка_на_сервере_или_пустая_строка)."""
-    already = read_resume_point(local_path, message.document) if local_path.exists() else 0
-    ensure_disk_space(max((message.document.size or 0) - already, 0), state)
-    await download_with_retry(message, local_path, state)
-
     upload_path = local_path
+    if job.url:
+        upload_path = await download_from_link(job, local_path, state)
+    else:
+        already = read_resume_point(local_path, message.document) if local_path.exists() else 0
+        ensure_disk_space(max((message.document.size or 0) - already, 0), state)
+        await download_with_retry(message, local_path, state)
     audio_path = local_path.with_suffix(".m4a")
     try:
         if job.extract:
@@ -2032,13 +2055,16 @@ async def transfer_file(message, job: Job, local_path: Path, state: TransferStat
         url, user, pw = TARGETS[job.kind]
         remote_name = job.filename
         where = ""
-        if job.kind == "movie" and job.series:
+        if job.subtitle:
+            await run_blocking(normalize_subtitle_file, str(upload_path))
+            remote_name, where = await resolve_subtitle_target(url, user, pw, job)
+        elif job.kind == "movie" and job.series:
             # Папки ищем/создаём только сейчас, перед отправкой: за время скачивания их мог создать другой файл.
             dirs = await resolve_series_dirs(url, user, pw, job.series["show"], int(job.series["season"]))
             remote_name = "/".join(dirs + [job.filename])
             where = "/".join(dirs)
         existed = await upload_with_retry(url, user, pw, remote_name, upload_path, state)
-        return existed, where
+        return existed, where, remote_name
     finally:
         remove_quietly(audio_path)
 
@@ -2057,8 +2083,9 @@ async def run_job(job: Job, message, send) -> None:
             ACTIVE_TRANSFERS.add(item.state)
             try:
                 # Watchdog на зависания работает внутри transfer_file — на каждой попытке скачивания/отправки.
-                existed, where = await transfer_file(message, job, job.local_path, item.state)
+                existed, where, remote_name = await transfer_file(message, job, job.local_path, item.state)
                 item.mark_ok(existed, where)
+                await record_history(job, remote_name, existed)
             except Exception as e:
                 log.exception("upload failed")
                 item.mark_error(describe_error(e))
@@ -2290,7 +2317,7 @@ async def plan_video(event, orig_filename: str, ext: str, parsed: Optional[dict]
 
     info["show"] = show
     leaf = orig_filename if info["name_ok"] else build_series_filename(info, ext)
-    return {"show": show, "season": info["season"]}, truncate_filename(leaf)
+    return {"show": show, "season": info["season"], "episode": info["episode"]}, truncate_filename(leaf)
 
 
 async def on_choice_button(event):
@@ -2366,7 +2393,12 @@ LIB_HELP = (
     "/set <id> поле=значение … — изменить теги: artist, title, album, albumartist, genre, year\n"
     "/del <id> [id …] — удалить треки вместе с файлами (спрошу подтверждение)\n"
     "/stats — статистика библиотеки\n"
-    "/rescan — пересканировать Navidrome"
+    "/rescan — пересканировать Navidrome\n"
+    "/history [N] — последние загрузки\n"
+    "/undo [номер] — отменить загрузку (удалить файл с сервера)\n"
+    "\n🔗 Пришлите ссылку (YouTube, YouTube Music, SoundCloud, Bandcamp …) — скачаю аудио (.m4a) или видео; "
+    "плейлисты и альбомы — целиком. «--force» в сообщении — загрузить, даже если такое уже есть.\n"
+    "💬 Субтитры (.srt .ass .vtt …) кладу рядом с видео под тем же именем."
 )
 
 
@@ -2621,11 +2653,839 @@ async def cmd_rescan(event, rest: str) -> None:
         await event.reply(scan_note(scan).strip())
 
 
+# ======================================================================
+# Новое: история загрузок и /undo · субтитры · проверка дубликатов · ссылки (yt-dlp)
+#
+#   HISTORY_DB          — файл истории (SQLite). По умолчанию TMP_DIR/state/history.sqlite3;
+#                         примонтируйте TMP_DIR как volume, чтобы история переживала пересоздание контейнера
+#   DUPLICATE_CHECK     — спрашивать, если такой трек/фильм/серия уже есть (1/0, по умолчанию 1)
+#   LINK_INGEST         — принимать ссылки (YouTube, YouTube Music, SoundCloud, Bandcamp …) через yt-dlp (1/0, по умолчанию 1)
+#   YTDLP_BIN           — команда yt-dlp (по умолчанию yt-dlp)
+#   YTDLP_COOKIES       — путь к cookies.txt (нужен для части видео YouTube: «Sign in to confirm you're not a bot»)
+#   YTDLP_EXTRA_ARGS    — дополнительные аргументы yt-dlp одной строкой (например, --js-runtimes node)
+#   YTDLP_TIMEOUT_SEC   — потолок на одно скачивание по ссылке (по умолчанию 1800)
+#   LINK_MAX_ENTRIES    — сколько элементов плейлиста/альбома брать максимум (по умолчанию 100)
+#   LINK_VIDEO_MAX_HEIGHT — потолок разрешения для видео по ссылке (по умолчанию 1080)
+#   LINK_EMBED_THUMB    — вшивать обложку в m4a (1/0, по умолчанию 1)
+#   SUBTITLE_RECODE     — приводить текстовые субтитры к UTF-8 (1/0, по умолчанию 1)
+#   SUBTITLE_FALLBACK_ENCODING — кодировка «не UTF-8» субтитров (по умолчанию cp1251)
+# ======================================================================
+HISTORY_DB = Path(os.environ.get("HISTORY_DB", str(TMP_DIR / "state" / "history.sqlite3")))
+DUPLICATE_CHECK = env_flag("DUPLICATE_CHECK", True)
+LINK_INGEST = env_flag("LINK_INGEST", True)
+YTDLP_BIN = os.environ.get("YTDLP_BIN", "yt-dlp")
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "").strip()
+YTDLP_EXTRA_ARGS = shlex.split(os.environ.get("YTDLP_EXTRA_ARGS", ""))
+YTDLP_TIMEOUT_SEC = int(os.environ.get("YTDLP_TIMEOUT_SEC", "1800"))
+LINK_MAX_ENTRIES = max(1, int(os.environ.get("LINK_MAX_ENTRIES", "100")))
+LINK_VIDEO_MAX_HEIGHT = int(os.environ.get("LINK_VIDEO_MAX_HEIGHT", "1080"))
+LINK_EMBED_THUMB = env_flag("LINK_EMBED_THUMB", True)
+SUBTITLE_RECODE = env_flag("SUBTITLE_RECODE", True)
+SUBTITLE_FALLBACK_ENCODING = os.environ.get("SUBTITLE_FALLBACK_ENCODING", "cp1251").strip() or "cp1251"
+SUBTITLE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def is_active(key: tuple) -> bool:
+    """Есть ли в работе задание этого сообщения (у заданий-по-ссылке ключ длиннее: (чат, сообщение, номер))."""
+    return any(k[:2] == key for k in ACTIVE_JOBS)
+
+
+def beets_ready() -> bool:
+    return bool(LIBRARY_ADMIN and shutil.which(BEETS_BIN) and Path(BEETS_CONFIG).exists())
+
+
+# ---------- история загрузок (SQLite) ----------
+_HISTORY_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS history ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, chat_id INTEGER NOT NULL, "
+    "kind TEXT NOT NULL, remote_name TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER DEFAULT 0, "
+    "replaced INTEGER DEFAULT 0, source TEXT DEFAULT '', undone INTEGER DEFAULT 0)"
+)
+
+
+def _history_conn() -> sqlite3.Connection:
+    HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(HISTORY_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute(_HISTORY_SCHEMA)
+    return conn
+
+
+def history_add(chat_id: int, kind: str, remote_name: str, filename: str, size: int, replaced: bool, source: str) -> None:
+    with contextlib.closing(_history_conn()) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO history (ts, chat_id, kind, remote_name, filename, size, replaced, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), chat_id, kind, remote_name, filename, size or 0, int(replaced), source),
+            )
+
+
+def history_list(chat_id: int, limit: int) -> list:
+    with contextlib.closing(_history_conn()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def history_get(chat_id: int, hid: Optional[int] = None) -> Optional[dict]:
+    with contextlib.closing(_history_conn()) as conn:
+        if hid is not None:
+            row = conn.execute("SELECT * FROM history WHERE id=? AND chat_id=?", (hid, chat_id)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM history WHERE chat_id=? AND undone=0 ORDER BY id DESC LIMIT 1", (chat_id,)
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def history_mark_undone(hid: int) -> None:
+    with contextlib.closing(_history_conn()) as conn:
+        with conn:
+            conn.execute("UPDATE history SET undone=1 WHERE id=?", (hid,))
+
+
+async def record_history(job: Job, remote_name: str, existed: bool) -> None:
+    """Запись об успешной загрузке. Сбой истории не должен портить саму загрузку."""
+    source = "subtitle" if job.subtitle else ("link" if job.url else "telegram")
+    try:
+        await run_blocking(history_add, job.chat_id, job.kind, remote_name, job.filename, job.size, existed, source)
+    except Exception as e:
+        log.warning("Не удалось записать загрузку в историю: %s", e)
+
+
+def _history_icon(row: dict) -> str:
+    if row["source"] == "subtitle":
+        return "💬"
+    return "🎵" if row["kind"] == "music" else "🎬"
+
+
+# ---------- содержимое папок на сервере ----------
+async def list_remote_entries(url, user, pw, segments: list) -> Optional[tuple]:
+    """(папки, файлы) в папке на сервере. ([], []) — папки нет; None — узнать не удалось."""
+    path = "/".join(quote(s, safe="") for s in segments)
+    base = f"{url.rstrip('/')}/" + (f"{path}/" if path else "")
+    try:
+        resp = await http.get(base + "?ls", auth=(user, pw), timeout=30)
+    except httpx.HTTPError as e:
+        log.warning("Не удалось получить список «%s»: %s", "/".join(segments) or "/", e)
+        return None
+    if resp.status_code == 404:
+        return [], []
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    def names(key: str) -> list:
+        out = []
+        for entry in data.get(key) or []:
+            href = entry.get("href") if isinstance(entry, dict) else entry
+            if isinstance(href, str):
+                name = unquote(href).strip("/").rsplit("/", 1)[-1]
+                if name:
+                    out.append(name)
+        return out
+
+    return names("dirs"), names("files")
+
+
+async def find_series_dirs(url, user, pw, show: str, season: int) -> Optional[list]:
+    """Существующие папки [сериал, сезон] без создания новых. None — такого сериала/сезона ещё нет."""
+    show = truncate_dirname(show)
+    root = await list_remote_dirs(url, user, pw, []) or []
+    show_dir = show if show in root else None
+    if show_dir is None:
+        key = series_key(show)
+        if key:
+            show_dir = next((n for n in sorted(root, key=str.casefold) if series_key(n) == key), None)
+    if show_dir is None:
+        return None
+    seasons = await list_remote_dirs(url, user, pw, [show_dir]) or []
+    season_dir = next((n for n in sorted(seasons, key=str.casefold) if season_number(n) == season), None)
+    return [show_dir, season_dir] if season_dir else None
+
+
+async def prune_empty_dirs(url, user, pw, segments: list) -> None:
+    """Удаляет опустевшие папки сериала (сезон, потом сериал). Папку трогаем, только убедившись, что она пуста:
+    DELETE на папку в copyparty рекурсивный."""
+    while segments:
+        entries = await list_remote_entries(url, user, pw, segments)
+        if entries is None or entries[0] or entries[1]:
+            return
+        if not await delete_remote_quietly(url, user, pw, "/".join(segments)):
+            return
+        segments = segments[:-1]
+
+
+# ---------- проверка дубликатов ----------
+async def find_library_matches(stem: str) -> list:
+    """Треки библиотеки beets с тем же исполнителем и названием (точное сравнение, без учёта регистра и знаков)."""
+    m = _ARTIST_TITLE_RE.match(stem)
+    if not m:
+        return []
+    artist, title = m.group(1).strip(), m.group(2).strip()
+    items = await find_items([f"artist:{artist}", f"title:{title}"])
+    ak, tk = series_key(artist), series_key(title)
+    return [it for it in items if series_key(it["artist"]) == ak and series_key(it["title"]) == tk]
+
+
+async def find_duplicate(kind: str, filename: str, series: Optional[dict]) -> Optional[str]:
+    """Текст про уже имеющийся файл или None."""
+    url, user, pw = TARGETS[kind]
+    if kind == "music":
+        if beets_ready():
+            try:
+                items = await find_library_matches(Path(filename).stem)
+            except LibraryError as e:
+                log.warning("Проверка библиотеки beets не удалась: %s", e)
+                items = []
+            if items:
+                more = f"\n…и ещё {len(items) - 3}" if len(items) > 3 else ""
+                return "Такой трек уже есть в библиотеке:\n" + "\n".join(item_line(it) for it in items[:3]) + more
+        if await get_remote_size(url, user, pw, filename) is not None:
+            return f"«{short_name(filename)}» уже лежит на сервере (ждёт импорта)."
+        return None
+    if series and series.get("episode") is not None:
+        dirs = await find_series_dirs(url, user, pw, series["show"], int(series["season"]))
+        if not dirs:
+            return None
+        entries = await list_remote_entries(url, user, pw, dirs)
+        if not entries:
+            return None
+        existing = pick_episode_video(entries[1], int(series["season"]), int(series["episode"]))
+        return f"Эта серия уже есть: {'/'.join(dirs)}/«{existing}»." if existing else None
+    size = await get_remote_size(url, user, pw, filename)
+    if size is not None:
+        extra = f" ({format_size(size)})" if size > 0 else ""
+        return f"«{short_name(filename)}» уже есть в фильмах{extra}."
+    return None
+
+
+def _dup_note(choice: Optional[str]) -> str:
+    if choice == "yes":
+        return "✅ Загружаю всё равно."
+    if choice is None:
+        return "⌛ Ответа не дождался — файл пропущен."
+    return "✖️ Отменено."
+
+
+# ---------- субтитры ----------
+_SUB_TAGS = {
+    "ru", "rus", "russian", "en", "eng", "english", "uk", "ukr", "de", "ger", "fr", "es", "it", "pt",
+    "ja", "jpn", "zh", "forced", "sdh", "default",
+}
+
+
+def split_sub_name(stem: str) -> tuple:
+    """«Movie.2021.ru.forced» → («Movie.2021», ['ru', 'forced']). Теги языка отделяются точкой или «_»."""
+    tags = []
+    base = stem
+    while True:
+        m = re.search(r"[._]([A-Za-z]{2,8})$", base)
+        if not (m and m.group(1).lower() in _SUB_TAGS):
+            break
+        tags.insert(0, m.group(1).lower())
+        base = base[: m.start()]
+    return base.strip(" ._-"), tags
+
+
+def pick_episode_video(files: list, season: int, episode: int) -> Optional[str]:
+    for f in sorted(files, key=str.casefold):
+        if Path(f).suffix.lower() not in VIDEO_EXTS:
+            continue
+        m = _SERIES_MARK_RE.search(Path(f).stem)
+        if m and int(m.group(1) or m.group(3)) == season and int(m.group(2) or m.group(4)) == episode:
+            return f
+    return None
+
+
+def _title_key(name: str) -> str:
+    """series_key + без года (в имени субтитров он бывает «Dune 2021», а у видео — «Dune (2021)»)."""
+    return series_key(re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", name))
+
+
+def pick_movie_video(files: list, base: str) -> Optional[str]:
+    sk = _title_key(base)
+    if not sk:
+        return None
+    vids = sorted((f for f in files if Path(f).suffix.lower() in VIDEO_EXTS), key=str.casefold)
+    keyed = [(f, _title_key(Path(f).stem)) for f in vids]
+    exact = [f for f, k in keyed if k == sk]
+    if exact:
+        return exact[0]
+    loose = [f for f, k in keyed if len(k) >= 6 and len(sk) >= 6 and (k.startswith(sk) or sk.startswith(k))]
+    return loose[0] if len(loose) == 1 else None
+
+
+def normalize_subtitle_file(path: str) -> None:
+    """Текстовые субтитры → UTF-8 без BOM (Jellyfin плохо угадывает cp1251/UTF-16 и показывает кракозябры).
+    Синхронная; вызывать через run_blocking. Бинарные форматы и уже нормальный UTF-8 не трогаем."""
+    if not SUBTITLE_RECODE or Path(path).suffix.lower() not in {".srt", ".ass", ".ssa", ".vtt", ".sub"}:
+        return
+    try:
+        p = Path(path)
+        if p.stat().st_size > SUBTITLE_MAX_BYTES:
+            return
+        raw = p.read_bytes()
+    except OSError:
+        return
+    try:
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text, enc = raw.decode("utf-16"), "utf-16"
+        elif raw.startswith(b"\xef\xbb\xbf"):
+            text, enc = raw.decode("utf-8-sig"), "utf-8-sig"
+        else:
+            try:
+                raw.decode("utf-8")
+                return  # уже UTF-8 (или чистый ASCII)
+            except UnicodeDecodeError:
+                text, enc = raw.decode(SUBTITLE_FALLBACK_ENCODING), SUBTITLE_FALLBACK_ENCODING
+    except (UnicodeDecodeError, LookupError) as e:
+        log.warning("Не удалось определить кодировку субтитров %s: %s", path, e)
+        return
+    try:
+        p.write_bytes(text.encode("utf-8"))
+        log.info("Субтитры перекодированы %s → UTF-8: %s", enc, path)
+    except OSError as e:
+        log.warning("Не удалось перезаписать субтитры: %s", e)
+
+
+async def plan_subtitle(event, orig_filename: str) -> tuple:
+    """(ok, series): series — {"show","season","episode"} для субтитров сериала, None — для фильма.
+    ok=False — файл надо пропустить."""
+    base, _tags = split_sub_name(Path(orig_filename).stem)
+    info = parse_episode_from_name(base)
+    if info is None:
+        return True, None
+    show = info["show"]
+    if not show or is_generic_name(show):
+        text = await ask_text(
+            event,
+            f"💬 «{orig_filename}» — субтитры к серии (сезон {info['season']}, серия {info['episode']}), "
+            f"но название сериала я не нашёл.",
+            "название сериала — например: Dune Prophecy",
+        )
+        show = clean_show_name(text or "")
+        if not show or is_generic_name(show):
+            if text:
+                await event.reply("🤷 Не разобрал название сериала — субтитры пропущены.")
+            return False, None
+    return True, {"show": show, "season": info["season"], "episode": info["episode"]}
+
+
+async def resolve_subtitle_target(url, user, pw, job: Job) -> tuple:
+    """Находит видео, к которому относятся субтитры, и называет файл так же (+ тег языка).
+    Возвращает (путь_на_сервере, текст_для_статуса). Меняет job.filename."""
+    base, tags = split_sub_name(Path(job.filename).stem)
+    ext = Path(job.filename).suffix
+    dirs: list = []
+    video = None
+    if job.series:
+        season = int(job.series["season"])
+        dirs = await resolve_series_dirs(url, user, pw, job.series["show"], season)
+        entries = await list_remote_entries(url, user, pw, dirs)
+        if entries and job.series.get("episode") is not None:
+            video = pick_episode_video(entries[1], season, int(job.series["episode"]))
+    else:
+        entries = await list_remote_entries(url, user, pw, [])
+        if entries:
+            video = pick_movie_video(entries[1], base)
+    if video:
+        leaf = Path(video).stem + "".join("." + t for t in tags) + ext
+        note = f"рядом с «{short_name(video, 50)}»"
+    else:
+        leaf = job.filename
+        note = "видео не найдено — имя оставлено как есть"
+    leaf = truncate_filename(leaf)
+    job.filename = leaf
+    where = "/".join(dirs)
+    where = f"{where} ({note})" if where else note
+    return "/".join(dirs + [leaf]), where
+
+
+# ---------- ссылки (yt-dlp) ----------
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_SKIP_URL_RE = re.compile(r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/", re.IGNORECASE)
+_MUSIC_HOSTS = ("music.youtube.com", "soundcloud.com", "bandcamp.com")
+_TITLE_NOISE_RE = re.compile(
+    r"\s*[\(\[]\s*(?:official\s+(?:music\s+)?(?:video|audio|lyric\s+video)|lyrics?(?:\s+video)?|audio|video|hd|hq|4k)\s*[\)\]]",
+    re.IGNORECASE,
+)
+_PERMANENT_YTDLP_RE = re.compile(
+    r"private video|video unavailable|not available|copyright|sign in|age-restricted|members-only|"
+    r"geo.?restricted|unsupported url|login required|premiere",
+    re.IGNORECASE,
+)
+
+
+def extract_urls(text: str) -> list:
+    urls = []
+    for m in _URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;:!?)»”'\"")
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
+def is_link_message(event) -> bool:
+    """Обычное текстовое сообщение со ссылкой (не команда и не ответ на вопрос бота)."""
+    if not LINK_INGEST or event.is_reply:
+        return False
+    text = event.raw_text or ""
+    if not text or text.startswith("/"):
+        return False
+    return any(not _SKIP_URL_RE.search(u) for u in extract_urls(text))
+
+
+def link_kind(url: str) -> Optional[str]:
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _MUSIC_HOSTS):
+        return "music"
+    return None
+
+
+def _is_single_video_url(url: str) -> bool:
+    """Ссылка на одно видео (в т.ч. с хвостом &list=…) — плейлист вокруг неё не разворачиваем."""
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if host == "youtu.be":
+        return True
+    return host.endswith("youtube.com") and p.path == "/watch" and "v" in parse_qs(p.query)
+
+
+def ytdlp_base_args() -> list:
+    args = [
+        YTDLP_BIN, "--ignore-config", "--no-warnings",
+        "--retries", "5", "--fragment-retries", "5", "--socket-timeout", "30",
+    ]
+    if YTDLP_COOKIES:
+        args += ["--cookies", YTDLP_COOKIES]
+    return args + YTDLP_EXTRA_ARGS
+
+
+def ytdlp_error(err: str, rc: int) -> TransferError:
+    lines = re.findall(r"ERROR:\s*(.+)", err)
+    tail = err.strip().splitlines()[-1] if err.strip() else f"код {rc}"
+    reason = (lines[-1] if lines else tail)[:200]
+    hint = ""
+    if re.search(r"sign in|not a bot|cookies", err, re.IGNORECASE):
+        hint = " (YouTube просит авторизацию — задайте YTDLP_COOKIES)"
+    return TransferError(f"yt-dlp: {reason}{hint}", retriable=not _PERMANENT_YTDLP_RE.search(err))
+
+
+async def _run_capture(cmd: list, timeout: int) -> tuple:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except FileNotFoundError:
+        raise TransferError(f"в образе бота нет «{cmd[0]}» — добавьте yt-dlp в requirements.txt") from None
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        raise TransferError(f"«{cmd[0]}» не ответил за {timeout} сек") from None
+    return proc.returncode, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
+
+
+def _entry_url(e: dict) -> Optional[str]:
+    for key in ("webpage_url", "url"):
+        u = e.get(key)
+        if isinstance(u, str) and u.startswith("http"):
+            return u
+    extractor = str(e.get("ie_key") or e.get("extractor_key") or "").lower()
+    if e.get("id") and extractor.startswith("youtube"):
+        return f"https://www.youtube.com/watch?v={e['id']}"
+    return None
+
+
+async def probe_link(url: str) -> tuple:
+    """(название_плейлиста, [элементы]). У элемента есть «_url» — по нему его и скачиваем."""
+    args = ytdlp_base_args() + ["-J", "--flat-playlist", "--skip-download"]
+    if _is_single_video_url(url):
+        args.append("--no-playlist")
+    args.append(url)
+    rc, out, err = await _run_capture(args, 120)
+    if rc != 0:
+        raise ytdlp_error(err, rc)
+    start = out.find("{")
+    try:
+        info = json.loads(out[start:]) if start >= 0 else None
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        raise TransferError("не удалось разобрать ответ yt-dlp")
+    entries = info.get("entries")
+    if entries is None:
+        return "", [dict(info, _url=url)]
+    items = []
+    for e in entries:
+        if isinstance(e, dict):
+            u = _entry_url(e)
+            if u:
+                items.append(dict(e, _url=u))
+    return info.get("title") or "", items
+
+
+def music_meta_from_info(info: dict, fallback: str = "") -> tuple:
+    """(исполнитель, название, альбом) из метаданных yt-dlp. У YouTube Music есть artist/track/album;
+    у обычных видео — «Исполнитель - Название» в заголовке или имя канала."""
+    artist = info.get("artist") or ""
+    if not artist and isinstance(info.get("artists"), list):
+        artist = ", ".join(str(a) for a in info["artists"] if a)
+    track = info.get("track")
+    title = track or _TITLE_NOISE_RE.sub("", info.get("title") or "") or fallback
+    if not artist:
+        m = _ARTIST_TITLE_RE.match(title)
+        if m:
+            artist, title = m.group(1), m.group(2)
+    if not artist:
+        artist = re.sub(r"\s*-\s*Topic$", "", info.get("uploader") or info.get("channel") or "")
+    artist = sanitize_name(artist) or "Unknown Artist"
+    title = sanitize_name(title) or "Untitled"
+    album = normalize_text(info.get("album") or "").strip()
+    return artist, title, album
+
+
+def fix_m4a_tags(path: str, artist: str, title: str, album: str) -> None:
+    """Исполнитель и название в тегах = тем, что в имени файла (иначе beets импортирует трек без тегов).
+    Синхронная; вызывать через run_blocking."""
+    try:
+        mp4 = MP4(path)
+        if mp4.tags is None:
+            mp4.add_tags()
+        mp4["\xa9ART"] = [artist]
+        mp4["\xa9nam"] = [title]
+        if album and not mp4.get("\xa9alb"):
+            mp4["\xa9alb"] = [album]
+        mp4.save()
+    except Exception as e:
+        log.warning("Не удалось записать теги m4a %s: %s", path, e)
+
+
+def _to_int(value: str) -> Optional[int]:
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+async def _run_ytdlp_download(args: list, state: TransferState) -> None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except FileNotFoundError:
+        raise TransferError(f"в образе бота нет «{args[0]}» — добавьте yt-dlp в requirements.txt") from None
+    err_task = asyncio.ensure_future(proc.stderr.read())
+
+    async def pump() -> int:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            parts = raw.decode("utf-8", errors="replace").split()
+            if len(parts) >= 4 and parts[0] == "PROG":
+                done = _to_int(parts[1])
+                total = _to_int(parts[2]) or _to_int(parts[3])
+                if done is not None:
+                    state.current = done
+                state.total = max(total or 0, state.current, 1)
+        return await proc.wait()
+
+    def kill() -> None:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+
+    try:
+        rc = await asyncio.wait_for(pump(), timeout=YTDLP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        kill()
+        err_task.cancel()
+        raise TransferError(f"yt-dlp не уложился в {YTDLP_TIMEOUT_SEC} сек") from None
+    except BaseException:
+        kill()
+        err_task.cancel()
+        raise
+    err = (await err_task).decode("utf-8", errors="replace")
+    if rc != 0:
+        raise ytdlp_error(err, rc)
+
+
+async def download_from_link(job: Job, local_path: Path, state: TransferState) -> Path:
+    """Скачивает job.url через yt-dlp в TMP_DIR, уточняет имя/теги по метаданным, проверяет дубликат.
+    Возвращает путь к готовому файлу (job.filename к этому моменту уже окончательный)."""
+    stem = local_path.stem
+    args = ytdlp_base_args() + [
+        "--no-playlist", "--no-mtime", "--newline", "--write-info-json",
+        "--progress-template",
+        "download:PROG %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s",
+        "-o", str(TMP_DIR / f"{stem}.%(ext)s"),
+    ]
+    if job.kind == "music":
+        args += ["-f", "bestaudio[ext=m4a]/bestaudio/best", "-x", "--audio-format", "m4a",
+                 "--audio-quality", "0", "--embed-metadata"]
+        if LINK_EMBED_THUMB:
+            args += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
+    else:
+        args += ["-S", f"res:{LINK_VIDEO_MAX_HEIGHT},vcodec:h264,acodec:m4a", "--merge-output-format", "mp4"]
+    args.append(job.url)
+
+    for attempt in (1, 2):
+        state.begin("download", attempt, current=0, total=1)
+        try:
+            await _run_ytdlp_download(args, state)
+            break
+        except TransferError as e:
+            log.warning("yt-dlp, попытка %s/2: %s", attempt, e.user_message)
+            if attempt == 2 or not e.retriable:
+                raise
+            await sleep_waiting(state, RETRY_BACKOFF_SEC)
+
+    wanted = (".m4a",) if job.kind == "music" else (".mp4", ".mkv", ".webm", ".mov")
+    out = next(
+        (TMP_DIR / f"{stem}{e}" for e in wanted
+         if (TMP_DIR / f"{stem}{e}").exists() and (TMP_DIR / f"{stem}{e}").stat().st_size > 0),
+        None,
+    )
+    if out is None:
+        raise TransferError("yt-dlp не создал файл")
+    size = out.stat().st_size
+    state.begin("download", state.attempt, current=size, total=size)
+
+    info: dict = {}
+    with contextlib.suppress(OSError, ValueError):
+        info = json.loads((TMP_DIR / f"{stem}.info.json").read_text(encoding="utf-8"))
+
+    if job.kind == "music":
+        artist, title, album = music_meta_from_info(info, fallback=Path(job.filename).stem)
+        job.filename = truncate_filename(f"{artist} - {title}.m4a")
+        await run_blocking(fix_m4a_tags, str(out), artist, title, album)
+    elif Path(job.filename).suffix.lower() != out.suffix.lower():
+        job.filename = truncate_filename(Path(job.filename).stem + out.suffix.lower())
+
+    if DUPLICATE_CHECK and not job.force:
+        try:
+            dup = await find_duplicate(job.kind, job.filename, job.series)
+        except Exception as e:
+            log.warning("Проверка дубликатов не удалась: %s", e)
+            dup = None
+        if dup:
+            raise TransferError("дубликат: " + dup.splitlines()[0].rstrip(":.") + " (добавьте --force к сообщению, чтобы загрузить всё равно)")
+    return out
+
+
+def _link_kind_note(choice: Optional[str]) -> str:
+    if choice == "music":
+        return "✅ Скачиваю аудио."
+    if choice == "movie":
+        return "✅ Скачиваю видео."
+    if choice is None:
+        return "⌛ Ответа не дождался — ссылка пропущена."
+    return "✖️ Отменено."
+
+
+async def ingest_link(event, url: str, force: bool) -> None:
+    status = await event.reply("🔎 Смотрю ссылку…")
+    try:
+        title, items = await probe_link(url)
+    except Exception as e:
+        log.warning("Ссылка %s не прочиталась: %s", url, e)
+        await safe_edit(status, f"❌ Ссылка не обработана: {describe_error(e)}.")
+        return
+    if not items:
+        await safe_edit(status, "🤷 По этой ссылке ничего не нашёл.")
+        return
+    total_found = len(items)
+    items = items[:LINK_MAX_ENTRIES]
+
+    async def drop_status() -> None:
+        with contextlib.suppress(Exception):
+            await status.delete()
+
+    kind = link_kind(url)
+    cut = f" (беру первые {len(items)})" if total_found > len(items) else ""
+    if kind is None:
+        first = short_name(items[0].get("title") or url, 70)
+        extra = f" и ещё {len(items) - 1}{cut}" if len(items) > 1 else ""
+        choice = await ask_choice(
+            event, f"🔗 Что скачать: «{first}»{extra}?",
+            [[("🎵 Аудио (m4a)", "music"), ("🎬 Видео", "movie")], [("✖️ Отмена", "cancel")]],
+            KIND_ALIASES, "1 — аудио (в музыку), 2 — видео (в фильмы), 0 — отмена", _link_kind_note,
+        )
+        if choice not in ("music", "movie"):
+            await drop_status()
+            return
+        kind = choice
+    elif len(items) > 1:
+        choice = await ask_choice(
+            event, f"📋 «{short_name(title or url, 60)}» — {len(items)} шт.{cut}. Скачать все как музыку?",
+            [[("⬇️ Скачать все", "yes"), ("✖️ Отмена", "cancel")]],
+            YES_ALIASES, "да — скачать, нет — отмена", _dup_note,
+        )
+        if choice != "yes":
+            await drop_status()
+            return
+
+    jobs = []
+    for i, it in enumerate(items, 1):
+        series = None
+        if kind == "music":
+            artist, ttl, _album = music_meta_from_info(it)
+            filename = truncate_filename(f"{artist} - {ttl}.m4a")
+        else:
+            name = sanitize_name(normalize_text(it.get("title") or it.get("id") or "video")) or "video"
+            filename = truncate_filename(name + ".mp4")
+            if len(items) == 1:
+                plan = await plan_video(event, filename, ".mp4", None, filename)
+                if plan is None:
+                    await drop_status()
+                    return
+                series, filename = plan
+        jobs.append(Job(
+            chat_id=event.chat_id, sender_id=event.sender_id, message_id=event.message.id,
+            kind=kind, filename=filename, size=0, series=series, url=it["_url"], part=i, force=force,
+        ))
+    for job in jobs:
+        journal_write(job)
+    await drop_status()
+    results = await asyncio.gather(*(run_job(j, None, event.reply) for j in jobs), return_exceptions=True)
+    for r in results:
+        if isinstance(r, BaseException):
+            log.error("Задание по ссылке завершилось с ошибкой: %r", r)
+
+
+async def handle_links(event) -> None:
+    text = event.raw_text or ""
+    force = "--force" in text
+    urls = [u for u in extract_urls(text) if not _SKIP_URL_RE.search(u)][:5]
+    for url in urls:
+        try:
+            await ingest_link(event, url, force)
+        except Exception as e:
+            log.exception("link ingest failed")
+            await event.reply(f"❌ Не получилось: {describe_error(e)}.")
+
+
+# ---------- /history и /undo ----------
+def _format_ts(ts: float) -> str:
+    return time.strftime("%d.%m %H:%M", time.localtime(ts))
+
+
+async def cmd_history(event, rest: str) -> None:
+    n = int(rest) if rest.strip().isdigit() else 10
+    n = max(1, min(n, LIB_MAX_LIST))
+    rows = await run_blocking(history_list, event.chat_id, n)
+    if not rows:
+        await event.reply("🕒 История пуста.")
+        return
+    lines = [
+        f"#{r['id']} · {_format_ts(r['ts'])} · {_history_icon(r)} {short_name(r['remote_name'], 70)}"
+        + (" ↩️" if r["undone"] else "")
+        for r in rows
+    ]
+    await event.reply("🕒 Последние загрузки:\n" + "\n".join(lines) + "\n\n/undo [номер] — отменить загрузку (↩️ — уже отменена)")
+
+
+def _undo_note(choice: Optional[str]) -> str:
+    if choice == "yes":
+        return "↩️ Отменяю…"
+    if choice is None:
+        return "⌛ Ответа не дождался — ничего не удалено."
+    return "✖️ Оставляю как есть."
+
+
+async def cmd_undo(event, rest: str) -> None:
+    arg = rest.strip()
+    if arg and not arg.isdigit():
+        await event.reply("Формат: /undo — последняя загрузка, или /undo <номер из /history>")
+        return
+    row = await run_blocking(history_get, event.chat_id, int(arg) if arg else None)
+    if row is None:
+        await event.reply("🤷 Нечего отменять." if not arg else f"🤷 Загрузки #{arg} нет в истории.")
+        return
+    if row["undone"]:
+        await event.reply(f"↩️ Загрузка #{row['id']} уже отменена.")
+        return
+
+    url, user, pw = TARGETS[row["kind"]]
+    name = row["remote_name"]
+    library_items: list = []
+    if row["kind"] == "music":
+        if await get_remote_size(url, user, pw, name) is not None:
+            question = f"↩️ Удалить с сервера «{short_name(name, 80)}»?"
+        else:
+            # Файла на copyparty уже нет — скорее всего, его успел забрать импорт в библиотеку beets.
+            library_items = await find_library_matches(Path(name).stem) if beets_ready() else []
+            if not library_items:
+                await event.reply(
+                    f"🤷 «{short_name(name, 80)}» уже нет на сервере, а в библиотеке я его не нашёл "
+                    f"(найти вручную: /find)."
+                )
+                return
+            listing = "\n".join(item_line(it) for it in library_items[:5])
+            question = (
+                "↩️ Файла уже нет на сервере — похоже, трек импортирован в библиотеку.\n"
+                f"Удалить из библиотеки (и с диска)?\n{listing}"
+            )
+    else:
+        question = f"↩️ Удалить «{short_name(name, 80)}» с сервера фильмов?"
+    if row["replaced"]:
+        question += "\n⚠️ Эта загрузка заменила старый файл — прежнюю версию вернуть нельзя."
+
+    answer = await ask_choice(
+        event, question,
+        [[("↩️ Отменить загрузку", "yes"), ("✖️ Нет", "cancel")]],
+        YES_ALIASES, "да — отменить, нет — оставить", _undo_note,
+    )
+    if answer != "yes":
+        return
+
+    if library_items:
+        done, problems = 0, []
+        for it in library_items:
+            try:
+                await run_beet("remove", "-d", "-f", f"id:{it['id']}")
+                done += 1
+            except LibraryError as e:
+                problems.append(f"#{it['id']}: {e}")
+        if done:
+            await run_blocking(history_mark_undone, row["id"])
+        scan = await navidrome_scan() if done else None
+        text = f"✅ Удалено из библиотеки: {done} из {len(library_items)}." + scan_note(scan)
+        if problems:
+            text += "\n⚠️ Не удалось:\n" + "\n".join(problems)
+        await event.reply(text)
+        return
+
+    if not await delete_remote_quietly(url, user, pw, name):
+        await event.reply("❌ Не удалось удалить файл с сервера — вероятно, у пользователя copyparty нет права delete.")
+        return
+    await run_blocking(history_mark_undone, row["id"])
+    note = ""
+    if row["kind"] == "movie":
+        await prune_empty_dirs(url, user, pw, name.split("/")[:-1])
+        scan = await refresh_jellyfin()
+        if scan is True:
+            note = "\n🔄 Сканирование Jellyfin запущено."
+        elif scan is False:
+            note = "\n⚠️ Jellyfin не ответил — запустите сканирование вручную."
+    await event.reply(f"✅ Загрузка #{row['id']} отменена: «{short_name(name, 80)}» удалён с сервера." + note)
+
+
 LIBRARY_COMMANDS = {
     "/help": cmd_help, "/start": cmd_help,
     "/find": cmd_find, "/last": cmd_last, "/info": cmd_info,
     "/rename": cmd_rename, "/set": cmd_set, "/del": cmd_del,
     "/stats": cmd_stats, "/rescan": cmd_rescan,
+    "/undo": cmd_undo, "/history": cmd_history,
 }
 
 
@@ -2634,7 +3494,7 @@ async def handle_library_command(event) -> None:
     handler = LIBRARY_COMMANDS.get(cmd.split("@")[0].lower())
     if handler is None:
         return
-    if not LIBRARY_ADMIN:
+    if not LIBRARY_ADMIN and handler not in (cmd_undo, cmd_history):
         await event.reply("🔒 Управление библиотекой выключено (LIBRARY_ADMIN=0).")
         return
     try:
@@ -2657,6 +3517,17 @@ async def handle_dm(event):
         return
 
     if not (event.media and event.document):
+        if is_link_message(event):
+            link_key = (event.chat_id, event.message.id)
+            if is_active(link_key):  # catch_up мог прислать сообщение повторно
+                log.info("Ссылка из сообщения %s уже обрабатывается — пропускаю повтор", event.message.id)
+                return
+            ACTIVE_JOBS.add(link_key)
+            try:
+                await process_message(event)
+            finally:
+                ACTIVE_JOBS.discard(link_key)
+            return
         await process_message(event)
         return
 
@@ -2680,6 +3551,8 @@ async def process_message(event):
             return
         if event.raw_text and event.raw_text.startswith("/"):
             await handle_library_command(event)
+        elif is_link_message(event):
+            await handle_links(event)
         return
 
     attrs = doc.attributes or []
@@ -2710,6 +3583,19 @@ async def process_message(event):
         orig_filename, mime_type, size=doc.size or 0,
         has_video_attr=has_video_attr, has_audio_attr=has_audio_attr,
     )
+    if kind == "subtitle":
+        ok, sub_series = await plan_subtitle(event, orig_filename)
+        if not ok:
+            return
+        job = Job(
+            chat_id=event.chat_id, sender_id=event.sender_id, message_id=event.message.id,
+            kind="movie", filename=truncate_filename(orig_filename), size=doc.size or 0,
+            series=sub_series, subtitle=True,
+        )
+        journal_write(job)
+        await run_job(job, event.message, event.reply)
+        return
+
     asked = False
     if kind is None:
         # Вопрос идёт ДО очереди загрузок, так что ожидание ответа не занимает слот.
@@ -2786,6 +3672,21 @@ async def process_message(event):
             return
         series, filename = plan
 
+    if DUPLICATE_CHECK:
+        try:
+            dup = await find_duplicate(kind, filename, series)
+        except Exception as e:
+            log.warning("Проверка дубликатов не удалась: %s", e)
+            dup = None
+        if dup:
+            answer = await ask_choice(
+                event, f"♻️ {dup}\nЗагрузить всё равно?",
+                [[("⬆️ Загрузить", "yes"), ("✖️ Отмена", "cancel")]],
+                YES_ALIASES, "да — загрузить, нет — отмена", _dup_note,
+            )
+            if answer != "yes":
+                return
+
     job = Job(
         chat_id=event.chat_id,
         sender_id=event.sender_id,
@@ -2803,11 +3704,13 @@ async def process_message(event):
 async def resume_one(job: Job) -> None:
     """Продолжает задание, прерванное остановкой бота."""
     try:
-        message = await client.get_messages(job.chat_id, ids=job.message_id)
-        if not message or not message.document:
-            log.warning("Сообщение %s пропало — задание «%s» отбрасываю", job.message_id, job.filename)
-            drop_job_files(job)
-            return
+        message = None
+        if not job.url:  # задания по ссылке не привязаны к документу в Telegram
+            message = await client.get_messages(job.chat_id, ids=job.message_id)
+            if not message or not message.document:
+                log.warning("Сообщение %s пропало — задание «%s» отбрасываю", job.message_id, job.filename)
+                drop_job_files(job)
+                return
         log.info("Продолжаю после перезапуска: «%s»", job.filename)
         await run_job(job, message, functools.partial(client.send_message, job.chat_id))
     except Exception:
@@ -2831,6 +3734,8 @@ async def main():
             log.warning("Управление библиотекой: «%s» не найден — команды /find, /del и т.д. работать не будут", BEETS_BIN)
         elif not Path(BEETS_CONFIG).exists():
             log.warning("Управление библиотекой: нет конфига %s — смонтируйте папку с конфигом beets", BEETS_CONFIG)
+    if LINK_INGEST and not shutil.which(YTDLP_BIN):
+        log.warning("Ссылки: «%s» не найден — установите yt-dlp (pip install yt-dlp), иначе ссылки работать не будут", YTDLP_BIN)
     try:
         await start_buttons_bot()
         await client.start()
