@@ -84,6 +84,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import httpx
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 from telethon.tl import types as tl_types
 from telethon.tl.types import (
     DocumentAttributeAudio,
@@ -1439,25 +1440,61 @@ async def _pwrite_all(fd: int, data: bytes, pos: int) -> None:
         pos += written
 
 
-async def download_unknown_size(message, local_path: Path, state: TransferState, attempt: int) -> None:
+async def make_download_client() -> TelegramClient:
+    """Create an isolated, in-memory Telegram client for one download attempt.
+
+    The long-lived client owns message updates and may retain a dead media-DC
+    socket. A fresh client per attempt gives Telethon a clean connection pool
+    without disconnecting the event client (which would cancel active handlers).
+    """
+    session_data = StringSession.save(client.session)
+    if not session_data:
+        raise TransferError("Не удалось открыть авторизованную сессию Telegram", retriable=False)
+
+    downloader = TelegramClient(
+        StringSession(session_data),
+        API_ID,
+        API_HASH,
+        connection_retries=3,
+        retry_delay=2,
+        auto_reconnect=True,
+        timeout=10,
+    )
+    try:
+        await asyncio.wait_for(downloader.connect(), timeout=30)
+        me = await asyncio.wait_for(downloader.get_me(), timeout=30)
+        if me is None:
+            raise TransferError("Не удалось проверить авторизацию загрузчика Telegram", retriable=True)
+        return downloader
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(downloader.disconnect(), timeout=10)
+        raise
+
+
+async def download_unknown_size(
+    message, local_path: Path, state: TransferState, attempt: int, downloader: TelegramClient
+) -> None:
     """Запасной путь: Telegram не сообщил размер документа — качаем одним потоком без докачки."""
     remove_quietly(meta_path(local_path))
     state.begin("download", attempt, current=0, total=1)
     with open(local_path, "wb") as f:
-        async for chunk in client.iter_download(message.document, request_size=DOWNLOAD_REQUEST_SIZE):
+        async for chunk in downloader.iter_download(message.document, request_size=DOWNLOAD_REQUEST_SIZE):
             await run_blocking(f.write, chunk)
             state.current += len(chunk)
             state.total = max(state.total, state.current)
 
 
-async def download_resumable(message, local_path: Path, state: TransferState, attempt: int) -> None:
+async def download_resumable(
+    message, local_path: Path, state: TransferState, attempt: int, downloader: TelegramClient
+) -> None:
     """Качает документ сегментами по DOWNLOAD_SEGMENT, DOWNLOAD_WORKERS штук одновременно, и продолжает с места
     обрыва: в «паспорте» (файл .meta) хранится граница, до которой все сегменты подряд скачаны полностью.
     Это работает и между попытками, и между перезапусками бота."""
     doc = message.document
     total = doc.size or 0
     if total <= 0:
-        await download_unknown_size(message, local_path, state, attempt)
+        await download_unknown_size(message, local_path, state, attempt, downloader)
         return
 
     nseg = (total + DOWNLOAD_SEGMENT - 1) // DOWNLOAD_SEGMENT
@@ -1487,7 +1524,7 @@ async def download_resumable(message, local_path: Path, state: TransferState, at
             end = min(start + DOWNLOAD_SEGMENT, total)
             chunks = (end - start + DOWNLOAD_REQUEST_SIZE - 1) // DOWNLOAD_REQUEST_SIZE
             pos = start
-            async for chunk in client.iter_download(
+            async for chunk in downloader.iter_download(
                 doc, offset=start, limit=chunks, request_size=DOWNLOAD_REQUEST_SIZE, file_size=total
             ):
                 chunk = chunk[: end - pos]
@@ -1559,10 +1596,18 @@ async def download_with_retry(message, local_path: Path, state: TransferState) -
     while attempt < DOWNLOAD_RETRIES:
         attempt += 1
         state.attempt = attempt
+        downloader = None
+        retry_wait = 0
         try:
             if need_refresh:
                 message = await refresh_message(message)
-            await with_stall_watchdog(download_resumable(message, local_path, state, attempt), state)
+            # Don't reuse the primary client's possibly stale media-DC sockets.
+            # This client uses a memory-only copy of the auth session and is
+            # closed after every attempt, including timed-out attempts.
+            downloader = await make_download_client()
+            await with_stall_watchdog(
+                download_resumable(message, local_path, state, attempt, downloader), state
+            )
             return
         except asyncio.CancelledError:
             raise
@@ -1582,13 +1627,21 @@ async def download_with_retry(message, local_path: Path, state: TransferState) -
             attempt -= 1  # честный FloodWait не считаем за неудачную попытку
             last_exc = e
             need_refresh = True
-            await sleep_waiting(state, wait)
+            retry_wait = wait
         except Exception as e:
             last_exc = e
             need_refresh = True
             log.warning("Попытка скачивания %s/%s не удалась: %s", attempt, DOWNLOAD_RETRIES, e)
             if attempt < DOWNLOAD_RETRIES:
-                await sleep_waiting(state, RETRY_BACKOFF_SEC * attempt)
+                retry_wait = RETRY_BACKOFF_SEC * attempt
+        finally:
+            if downloader is not None:
+                try:
+                    await asyncio.wait_for(downloader.disconnect(), timeout=10)
+                except Exception as e:
+                    log.warning("Не удалось закрыть временный Telegram-клиент загрузки: %s", e)
+        if retry_wait:
+            await sleep_waiting(state, retry_wait)
     raise last_exc
 
 
